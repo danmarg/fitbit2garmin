@@ -1,0 +1,8 @@
+config.yaml
+token.json
+*.fit
+__pycache__/
+.venv/
+.pytest_cache/
+*.pyc
+data/

@@ -1,0 +1,24 @@
+# Shadow Sync Configuration
+# Copy this to config.yaml and fill in your values.
+
+fitbit:
+  client_id: "YOUR_FITBIT_CLIENT_ID"
+  client_secret: "YOUR_FITBIT_CLIENT_SECRET"
+  # token.json will be created after first auth run
+
+garmin:
+  email: "your@email.com"
+  password: "YOUR_GARMIN_PASSWORD"
+  # garth session is cached in ~/.garth after first login
+
+device:
+  # Extract these from a WELLNESS .fit file (not an activity) using identity_grabber.py
+  # Download a wellness file from Garmin Connect > Health Stats > Download
+  manufacturer: 1         # 1 = Garmin
+  product_id: 4063        # e.g. 4063 = Forerunner 265 / Fenix 7 series
+  serial_number: 123456789
+  software_version: 331   # raw value: actual_version * 100 (e.g. 331 = firmware 3.31)
+
+sync:
+  lookback_hours: 4     # How many hours back to pull from Fitbit
+  interval_minutes: 120 # How often to run the sync loop
