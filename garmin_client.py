@@ -30,20 +30,26 @@ class GarminClient:
         """Authenticate (reuse cached session if available)."""
         garth.configure(domain="garmin.com")
 
-        if os.path.isdir(GARTH_HOME):
+        # Only attempt resume if the directory exists AND contains tokens.
+        # This prevents FileNotFoundError if the user created an empty volume mount.
+        if os.path.isdir(GARTH_HOME) and os.path.isfile(os.path.join(GARTH_HOME, "oauth1_token.json")):
             try:
                 garth.resume(GARTH_HOME)
                 garth.client.username  # trigger validation
                 log.info("Resumed existing Garmin session from %s", GARTH_HOME)
                 self._client = garth.client
                 return
-            except Exception:
-                log.info("Cached session invalid, re-authenticating…")
+            except Exception as e:
+                log.info("Cached session invalid or incomplete (%s), re-authenticating…", e)
 
+        log.info("Logging into Garmin Connect...")
         garth.login(self.email, self.password)
+        
+        # Ensure directory exists before saving
+        os.makedirs(GARTH_HOME, exist_ok=True)
         garth.save(GARTH_HOME)
         self._client = garth.client
-        log.info("Garmin authentication successful.")
+        log.info("Garmin authentication successful. Session saved to %s", GARTH_HOME)
 
     def _ensure_connected(self):
         if self._client is None:
