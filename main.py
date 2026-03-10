@@ -6,6 +6,7 @@ Pulls Fitbit intraday data, encodes a Garmin Monitoring FIT file, and uploads it
 
 import logging
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
@@ -33,6 +34,18 @@ def load_config(path: str) -> dict:
         sys.exit(1)
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def run_hook(command: str | None):
+    """Run a shell command as a hook."""
+    if not command:
+        return
+    log.info("Running hook: %s", command)
+    try:
+        # Run in a subshell, ignore exit code to avoid crashing the sync loop
+        subprocess.run(command, shell=True, check=False)
+    except Exception as e:
+        log.error("Hook execution failed: %s", e)
 
 
 def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]:
@@ -129,11 +142,15 @@ def main():
 
     log.info("Shadow Sync started. Interval: %d minutes.", interval_minutes)
 
+    hooks = cfg.get("sync", {}).get("hooks", {})
+
     while True:
         try:
             run_sync(cfg, fitbit, garmin)
+            run_hook(hooks.get("on_success"))
         except Exception as e:
             log.exception("Sync cycle failed: %s", e)
+            run_hook(hooks.get("on_failure"))
 
         log.info("Sleeping %d minutes until next sync…", interval_minutes)
         time.sleep(interval_seconds)
