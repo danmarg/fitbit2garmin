@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 *.pyc
 data/
+
+.gemini/
+gha-creds-*.json
