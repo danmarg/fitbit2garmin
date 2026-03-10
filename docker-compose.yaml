@@ -1,0 +1,10 @@
+services:
+  shadow-sync:
+    build: .
+    container_name: shadow-sync
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    environment:
+      - CONFIG_FILE=/app/data/config.yaml
+      - GARTH_HOME=/app/data/garth
