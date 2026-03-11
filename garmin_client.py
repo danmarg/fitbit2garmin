@@ -21,6 +21,7 @@ class GarminClient:
         self.email = email
         self.password = password
         self._client: garth.Client | None = None
+        self._display_name: str | None = None
 
     # ------------------------------------------------------------------
     # Session management
@@ -38,18 +39,25 @@ class GarminClient:
                 garth.client.username  # trigger validation
                 log.info("Resumed existing Garmin session from %s", GARTH_HOME)
                 self._client = garth.client
+                self._display_name = self._fetch_display_name()
                 return
             except Exception as e:
                 log.info("Cached session invalid or incomplete (%s), re-authenticating…", e)
 
         log.info("Logging into Garmin Connect...")
         garth.login(self.email, self.password)
-        
+
         # Ensure directory exists before saving
         os.makedirs(GARTH_HOME, exist_ok=True)
         garth.save(GARTH_HOME)
         self._client = garth.client
+        self._display_name = self._fetch_display_name()
         log.info("Garmin authentication successful. Session saved to %s", GARTH_HOME)
+
+    def _fetch_display_name(self) -> str:
+        """Fetch the UUID display name required by the wellness API."""
+        resp = self._client.connectapi("/userprofile-service/socialProfile")
+        return resp["displayName"]
 
     def _ensure_connected(self):
         if self._client is None:
@@ -71,7 +79,7 @@ class GarminClient:
         """
         self._ensure_connected()
         try:
-            url = f"/wellness-service/wellness/dailyHeartRate/{date}"
+            url = f"/wellness-service/wellness/dailyHeartRate/{self._display_name}?date={date}"
             resp = self._client.connectapi(url)
             values = resp.get("heartRateValues") or []
             covered = set()
