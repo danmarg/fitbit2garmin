@@ -22,6 +22,8 @@ device:
 sync:
   lookback_hours: 4     # How many hours back to pull from Fitbit
   interval_minutes: 120 # How often to run the sync loop
+  recency_minutes: 60   # Don't upload data newer than this many minutes;
+                        # gives the real Garmin device time to sync first
   hooks:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"

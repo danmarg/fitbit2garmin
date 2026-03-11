@@ -7,7 +7,7 @@ binary FIT files via the device sync endpoint.
 import io
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import garth
 
@@ -56,110 +56,68 @@ class GarminClient:
             self.connect()
 
     # ------------------------------------------------------------------
-    # Conflict check
+    # Covered-minute check
     # ------------------------------------------------------------------
 
-    GARMIN_EPOCH = 631065600  # 1989-12-31 00:00:00 UTC
-
-    def get_real_device_windows(self, date: str) -> list[tuple[datetime, datetime]]:
+    def get_covered_minutes(self, date: str) -> set[datetime]:
         """
-        Fetch the time ranges for `date` (YYYY-MM-DD) that already have real
-        device HR data on Garmin Connect.
+        Return the set of UTC minute-datetimes that already have HR data on
+        Garmin Connect for the given date (YYYY-MM-DD), regardless of whether
+        that data came from a real device or a previous shadow-sync upload.
 
-        The wellness HR endpoint returns heartRateValues as a list of
-        [garmin_timestamp_ms, bpm] pairs. Consecutive readings from the real
-        device form contiguous windows; we return those windows so callers can
-        check overlap against the Fitbit window they want to upload.
-
-        Returns a list of (start, end) datetime pairs (UTC), possibly empty.
+        Used to avoid uploading Fitbit data over a minute that is already
+        populated (by any source).  Falls back to an empty set on 403/error
+        so callers can continue safely without this check.
         """
         self._ensure_connected()
         try:
             url = f"/wellness-service/wellness/dailyHeartRate/{date}"
             resp = self._client.connectapi(url)
             values = resp.get("heartRateValues") or []
-            if not values:
-                return []
-
-            # values is [[epoch_ms, bpm], ...]; bpm can be None for gaps
-            timestamps = sorted(
-                v[0] / 1000.0  # ms → seconds
-                for v in values
-                if v[1] is not None  # skip null/gap entries
-            )
-            if not timestamps:
-                return []
-
-            # Group consecutive timestamps into windows (gap > 5 min = new window)
-            GAP = 5 * 60
-            windows = []
-            seg_start = timestamps[0]
-            seg_end = timestamps[0]
-            for ts in timestamps[1:]:
-                if ts - seg_end <= GAP:
-                    seg_end = ts
-                else:
-                    windows.append((
-                        datetime.fromtimestamp(seg_start, tz=timezone.utc),
-                        datetime.fromtimestamp(seg_end, tz=timezone.utc),
-                    ))
-                    seg_start = seg_end = ts
-            windows.append((
-                datetime.fromtimestamp(seg_start, tz=timezone.utc),
-                datetime.fromtimestamp(seg_end, tz=timezone.utc),
-            ))
-
-            log.info(
-                "Garmin real-device windows for %s: %s",
-                date,
-                [(s.strftime("%H:%M"), e.strftime("%H:%M")) for s, e in windows],
-            )
-            return windows
-
+            covered = set()
+            for v in values:
+                if v[1] is not None:  # skip null/gap entries
+                    # heartRateValues timestamps are in ms since Unix epoch
+                    dt = datetime.fromtimestamp(v[0] / 1000.0, tz=timezone.utc)
+                    # Truncate to the minute so we match FitbitClient's 1-min resolution
+                    covered.add(dt.replace(second=0, microsecond=0))
+            log.info("Garmin already has %d covered minute(s) for %s", len(covered), date)
+            return covered
         except Exception as e:
-            # 403 is expected if the Garmin account doesn't have wellness-API access
-            # (most consumer accounts). Upload will proceed without gap filtering.
             log.info(
-                "Could not fetch existing Garmin HR data for %s (non-critical, proceeding without gap check): %s",
+                "Could not fetch existing Garmin HR data for %s "
+                "(wellness API unavailable, skipping coverage check): %s",
                 date, e,
             )
-            return []
+            return set()
 
-    def filter_points_to_gaps(self, points: list[dict]) -> list[dict]:
+    def filter_covered_points(self, points: list[dict]) -> list[dict]:
         """
-        Remove any Fitbit data points that fall inside a real Forerunner window
-        already on Garmin Connect.  What remains are only the minutes where the
-        Forerunner was NOT syncing, which is what we want to fill in.
+        Remove any points whose minute already has HR data on Garmin Connect.
 
-        Points spanning midnight are handled correctly because we query each
-        affected date separately.
+        This prevents uploading Fitbit data over any minute that's already
+        populated — whether from a real device sync or a previous shadow-sync
+        upload.  When the wellness API is unavailable (403), all points pass
+        through so the StateStore watermark acts as the fallback guard.
         """
         if not points:
             return []
 
-        # Fetch real-device windows for every date touched by the points list.
         dates_needed = {p["datetime"].strftime("%Y-%m-%d") for p in points}
-        real_windows: list[tuple[datetime, datetime]] = []
+        covered: set[datetime] = set()
         for date in dates_needed:
-            real_windows.extend(self.get_real_device_windows(date))
+            covered |= self.get_covered_minutes(date)
 
-        if not real_windows:
-            return points  # nothing to subtract
+        if not covered:
+            return points
 
-        def in_real_window(dt: datetime) -> bool:
-            aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-            for real_start, real_end in real_windows:
-                if real_start <= aware <= real_end:
-                    return True
-            return False
-
-        filtered = [p for p in points if not in_real_window(p["datetime"])]
+        filtered = [
+            p for p in points
+            if p["datetime"].replace(second=0, microsecond=0) not in covered
+        ]
         removed = len(points) - len(filtered)
         if removed:
-            log.info(
-                "Filtered out %d Fitbit point(s) covered by real Forerunner data.",
-                removed,
-            )
+            log.info("Skipping %d point(s) already present on Garmin Connect.", removed)
         return filtered
 
     # ------------------------------------------------------------------
