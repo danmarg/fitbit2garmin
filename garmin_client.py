@@ -117,7 +117,12 @@ class GarminClient:
             return windows
 
         except Exception as e:
-            log.warning("Could not fetch existing Garmin data: %s", e)
+            # 403 is expected if the Garmin account doesn't have wellness-API access
+            # (most consumer accounts). Upload will proceed without gap filtering.
+            log.info(
+                "Could not fetch existing Garmin HR data for %s (non-critical, proceeding without gap check): %s",
+                date, e,
+            )
             return []
 
     def filter_points_to_gaps(self, points: list[dict]) -> list[dict]:

@@ -16,7 +16,10 @@ from requests_oauthlib.compliance_fixes import fitbit_compliance_fix
 
 log = logging.getLogger(__name__)
 
-TOKEN_FILE = os.environ.get("FITBIT_TOKEN_FILE", os.path.join(os.path.dirname(os.environ.get("CONFIG_FILE", "config.yaml")), "token.json"))
+TOKEN_FILE = os.environ.get(
+    "FITBIT_TOKEN_FILE",
+    os.path.join(os.path.dirname(os.environ.get("CONFIG_FILE", os.path.join("data", "config.yaml"))), "token.json"),
+)
 AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
 TOKEN_URL = "https://api.fitbit.com/oauth2/token"
 API_BASE = "https://api.fitbit.com/1/user/-"
@@ -65,6 +68,9 @@ class FitbitClient:
         auth_url, _ = self.session.authorization_url(AUTH_URL)
         print(f"\nOpen this URL in your browser:\n  {auth_url}\n")
         redirect_response = input("Paste the full redirect URL here: ").strip()
+        # Allow http://localhost redirect URIs during the local OAuth flow.
+        # requests-oauthlib rejects http:// by default; this flag disables that check.
+        os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
         token = self.session.fetch_token(
             TOKEN_URL,
             authorization_response=redirect_response,
@@ -117,17 +123,19 @@ class FitbitClient:
         resp.raise_for_status()
         return resp.json().get("user", {}).get("timezone", "UTC")
 
-    def get_combined_intraday(self, lookback_hours: int = 4) -> list[dict]:
+    def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:
         """
         Fetch HR + Steps for the last `lookback_hours` hours, merged by minute,
         converted to UTC based on the user's Fitbit profile timezone.
 
-        Returns a list of dicts:
-            [{"datetime": datetime (UTC aware), "heart_rate": int, "steps_delta": int, "cumulative_steps": int}, ...]
-        sorted ascending by time.
+        Returns a tuple of:
+          - list of dicts:
+              [{"datetime": datetime (UTC aware), "heart_rate": int, "steps_delta": int, "cumulative_steps": int}, ...]
+              sorted ascending by time.
+          - utc_offset_seconds: the user's current UTC offset in whole seconds (e.g. 3600 for UTC+1)
         """
         import pytz
-        
+
         try:
             tz_name = self.get_user_timezone()
             log.info("Fitbit user timezone: %s", tz_name)
@@ -196,4 +204,8 @@ class FitbitClient:
             )
 
         log.info("Got %d merged intraday points for last %dh", len(merged), lookback_hours)
-        return merged
+        # Compute the current UTC offset for the user's timezone (handles DST automatically)
+        utc_offset = now_local.utcoffset()
+        utc_offset_seconds = int(utc_offset.total_seconds()) if utc_offset is not None else 0
+        log.info("UTC offset for FIT local_timestamp: %+ds (%+.1fh)", utc_offset_seconds, utc_offset_seconds / 3600)
+        return merged, utc_offset_seconds
