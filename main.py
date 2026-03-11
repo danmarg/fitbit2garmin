@@ -4,12 +4,13 @@ Shadow Sync orchestration loop.
 Pulls Fitbit intraday data, encodes a Garmin Monitoring FIT file, and uploads it.
 """
 
+import json
 import logging
 import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import yaml
 
@@ -24,7 +25,38 @@ logging.basicConfig(
 )
 log = logging.getLogger("shadow_sync")
 
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.yaml")
+CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join("data", "config.yaml"))
+STATE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "state.json")
+
+
+class StateStore:
+    """Persist the timestamp of the last successfully uploaded data point."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def load_last_uploaded(self) -> datetime | None:
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("last_uploaded_ts")
+            if raw:
+                return datetime.fromisoformat(raw)
+        except (FileNotFoundError, KeyError, ValueError):
+            pass
+        return None
+
+    def save_last_uploaded(self, dt: datetime):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        data = {}
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, ValueError):
+            pass
+        data["last_uploaded_ts"] = dt.isoformat()
+        with open(self.path, "w") as f:
+            json.dump(data, f, indent=2)
+        log.debug("State saved: last_uploaded_ts=%s", dt.isoformat())
 
 
 def load_config(path: str) -> dict:
@@ -68,7 +100,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     return segments
 
 
-def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient):
+def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: StateStore):
     """Execute one full sync cycle."""
     log.info("=== Shadow Sync cycle starting ===")
 
@@ -83,18 +115,37 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient):
         log.warning("No Fitbit data returned for the last %dh — skipping.", lookback)
         return
 
-    # 2. Remove minutes already covered by a real Forerunner sync
+    # 2. Drop points we already uploaded (prevents re-uploading on every cycle
+    #    when the Garmin wellness API is unavailable for gap-checking).
+    last_uploaded = state.load_last_uploaded()
+    if last_uploaded is not None:
+        before = len(points)
+        points = [p for p in points if p["datetime"] > last_uploaded]
+        log.info(
+            "Skipping %d already-uploaded point(s) (last uploaded: %s).",
+            before - len(points),
+            last_uploaded.strftime("%H:%M:%S UTC"),
+        )
+
+    if not points:
+        log.info("No new Fitbit data since last upload — nothing to do.")
+        return
+
+    # 3. Remove minutes already covered by a real Forerunner sync (best-effort;
+    #    skipped gracefully when the wellness API returns 403).
     points = garmin.filter_points_to_gaps(points)
 
     if not points:
-        log.info("All Fitbit data is covered by real Forerunner data — nothing to upload.")
+        log.info("All new Fitbit data is covered by real Forerunner data — nothing to upload.")
         return
 
-    # 3. Split into contiguous segments (Forerunner windows may have punched holes)
+    # 4. Split into contiguous segments (Forerunner windows may have punched holes)
     segments = split_segments(points)
     log.info("%d contiguous segment(s) to upload after gap removal.", len(segments))
 
-    # 4. Build + upload one FIT file per segment
+    last_point_uploaded: datetime | None = None
+
+    # 5. Build + upload one FIT file per segment
     for i, seg in enumerate(segments, 1):
         # Reset cumulative steps for this segment to start at 0
         current_cumulative = 0
@@ -121,12 +172,18 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient):
         )
         result = garmin.upload_fit_for_window(fit_bytes, window_start)
         log.info("Upload complete: %s", result)
+        last_point_uploaded = window_end
+
+    # 6. Persist the watermark so the next cycle skips these points.
+    if last_point_uploaded is not None:
+        state.save_last_uploaded(last_point_uploaded)
 
     log.info("=== Shadow Sync cycle done ===")
 
 
 def main():
     cfg = load_config(CONFIG_FILE)
+    state = StateStore(STATE_FILE)
 
     fitbit = FitbitClient(
         client_id=cfg["fitbit"]["client_id"],
@@ -147,7 +204,7 @@ def main():
 
     while True:
         try:
-            run_sync(cfg, fitbit, garmin)
+            run_sync(cfg, fitbit, garmin, state)
             run_hook(hooks.get("on_success"))
         except Exception as e:
             log.exception("Sync cycle failed: %s", e)
