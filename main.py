@@ -84,7 +84,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     """
     Split a list of per-minute points into contiguous segments.
     A new segment begins whenever two consecutive points are more than
-    `gap_minutes` apart (i.e. the Forerunner window punched a hole in the data).
+    `gap_minutes` apart (e.g. Fitbit was off-wrist or data was missing).
     """
     if not points:
         return []
@@ -131,21 +131,13 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.info("No new Fitbit data since last upload — nothing to do.")
         return
 
-    # 3. Remove minutes already covered by a real Forerunner sync (best-effort;
-    #    skipped gracefully when the wellness API returns 403).
-    points = garmin.filter_points_to_gaps(points)
-
-    if not points:
-        log.info("All new Fitbit data is covered by real Forerunner data — nothing to upload.")
-        return
-
-    # 4. Split into contiguous segments (Forerunner windows may have punched holes)
+    # 3. Split into contiguous segments
     segments = split_segments(points)
-    log.info("%d contiguous segment(s) to upload after gap removal.", len(segments))
+    log.info("%d contiguous segment(s) to upload.", len(segments))
 
     last_point_uploaded: datetime | None = None
 
-    # 5. Build + upload one FIT file per segment
+    # 4. Build + upload one FIT file per segment
     for i, seg in enumerate(segments, 1):
         # Reset cumulative steps for this segment to start at 0
         current_cumulative = 0
@@ -174,7 +166,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.info("Upload complete: %s", result)
         last_point_uploaded = window_end
 
-    # 6. Persist the watermark so the next cycle skips these points.
+    # 5. Persist the watermark so the next cycle skips these points.
     if last_point_uploaded is not None:
         state.save_last_uploaded(last_point_uploaded)
 
