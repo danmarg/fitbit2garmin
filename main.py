@@ -77,7 +77,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient):
 
     # 1. Pull Fitbit data
     fitbit.ensure_authorized()
-    points = fitbit.get_combined_intraday(lookback_hours=lookback)
+    points, utc_offset_seconds = fitbit.get_combined_intraday(lookback_hours=lookback)
 
     if not points:
         log.warning("No Fitbit data returned for the last %dh — skipping.", lookback)
@@ -117,6 +117,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient):
             product_id=device["product_id"],
             serial_number=device["serial_number"],
             software_version=device.get("software_version", 331),
+            utc_offset_seconds=utc_offset_seconds,
         )
         result = garmin.upload_fit_for_window(fit_bytes, window_start)
         log.info("Upload complete: %s", result)

@@ -128,14 +128,19 @@ def _device_info_messages(manufacturer: int, product_id: int, serial_number: int
     return defn + data
 
 
-def _monitoring_info_message(ts: int, activity_type: int = 0) -> bytes:
-    """Emit monitoring_info definition + data (local mesg 2)."""
+def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0, activity_type: int = 0) -> bytes:
+    """Emit monitoring_info definition + data (local mesg 2).
+
+    local_timestamp = Garmin UTC timestamp + local UTC offset in seconds.
+    Garmin uses this to assign data to the correct local calendar day.
+    """
     defn = _definition_record(2, MESG_NUM_MONITORING_INFO, [
         (253, 4, UINT32),  # timestamp
-        (0,   4, UINT32),  # local_timestamp (UTC offset = 0 for simplicity)
+        (0,   4, UINT32),  # local_timestamp
         (1,   1, UINT8),   # activity_type
     ])
-    data = _data_record(2, [ts, ts, activity_type], "IIB")
+    local_ts = ts + utc_offset_seconds
+    data = _data_record(2, [ts, local_ts, activity_type], "IIB")
     return defn + data
 
 
@@ -171,6 +176,7 @@ def build_monitoring_fit(
     product_id: int,
     serial_number: int,
     software_version: int = 331,
+    utc_offset_seconds: int = 0,
 ) -> bytes:
     """
     Build a complete, valid Garmin Monitoring FIT file (type 9).
@@ -180,6 +186,7 @@ def build_monitoring_fit(
         manufacturer: Garmin manufacturer ID (usually 1)
         product_id: Garmin product ID from identity_grabber
         serial_number: Device serial number from identity_grabber
+        utc_offset_seconds: local UTC offset in seconds (e.g. 3600 for UTC+1)
 
     Returns:
         Raw bytes of the .fit file ready to upload.
@@ -193,7 +200,7 @@ def build_monitoring_fit(
     messages = b""
     messages += _file_id_messages(manufacturer, product_id, serial_number, first_ts)
     messages += _device_info_messages(manufacturer, product_id, serial_number, first_ts, software_version)
-    messages += _monitoring_info_message(first_ts)
+    messages += _monitoring_info_message(first_ts, utc_offset_seconds)
     messages += _monitoring_messages(points)
 
     # FIT file header (14 bytes)
