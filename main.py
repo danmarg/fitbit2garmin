@@ -105,6 +105,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
     log.info("=== Shadow Sync cycle starting ===")
 
     lookback = cfg["sync"].get("lookback_hours", 4)
+    recency_minutes = cfg["sync"].get("recency_minutes", 60)
     device = cfg["device"]
 
     # 1. Pull Fitbit data
@@ -115,8 +116,22 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.warning("No Fitbit data returned for the last %dh — skipping.", lookback)
         return
 
-    # 2. Drop points we already uploaded (prevents re-uploading on every cycle
-    #    when the Garmin wellness API is unavailable for gap-checking).
+    # 2. Apply recency buffer: hold back data newer than recency_minutes.
+    #    This gives the real Garmin device time to sync its own data first,
+    #    so the coverage check below can see it and skip those minutes.
+    recency_cutoff = datetime.now(timezone.utc) - timedelta(minutes=recency_minutes)
+    before = len(points)
+    points = [p for p in points if p["datetime"] <= recency_cutoff]
+    held_back = before - len(points)
+    if held_back:
+        log.info("Holding back %d point(s) newer than %d min ago.", held_back, recency_minutes)
+
+    if not points:
+        log.info("All Fitbit data is within the recency buffer — nothing to upload yet.")
+        return
+
+    # 3. Drop points we already uploaded (StateStore watermark).
+    #    Acts as fallback deduplication when the wellness API is unavailable.
     last_uploaded = state.load_last_uploaded()
     if last_uploaded is not None:
         before = len(points)
@@ -131,13 +146,23 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.info("No new Fitbit data since last upload — nothing to do.")
         return
 
-    # 3. Split into contiguous segments
+    # 4. Skip any minute already populated on Garmin (from any source —
+    #    real device or a previous shadow upload).  This prevents overwriting
+    #    data that beat us to Garmin, while the recency buffer makes it likely
+    #    that real-device data arrived first for recent minutes.
+    points = garmin.filter_covered_points(points)
+
+    if not points:
+        log.info("All candidate points are already covered on Garmin — nothing to upload.")
+        return
+
+    # 5. Split into contiguous segments
     segments = split_segments(points)
     log.info("%d contiguous segment(s) to upload.", len(segments))
 
     last_point_uploaded: datetime | None = None
 
-    # 4. Build + upload one FIT file per segment
+    # 6. Build + upload one FIT file per segment
     for i, seg in enumerate(segments, 1):
         # Reset cumulative steps for this segment to start at 0
         current_cumulative = 0
@@ -166,7 +191,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.info("Upload complete: %s", result)
         last_point_uploaded = window_end
 
-    # 5. Persist the watermark so the next cycle skips these points.
+    # 7. Persist the watermark so the next cycle skips these points.
     if last_point_uploaded is not None:
         state.save_last_uploaded(last_point_uploaded)
 

@@ -7,7 +7,7 @@ binary FIT files via the device sync endpoint.
 import io
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import garth
 
@@ -54,6 +54,71 @@ class GarminClient:
     def _ensure_connected(self):
         if self._client is None:
             self.connect()
+
+    # ------------------------------------------------------------------
+    # Covered-minute check
+    # ------------------------------------------------------------------
+
+    def get_covered_minutes(self, date: str) -> set[datetime]:
+        """
+        Return the set of UTC minute-datetimes that already have HR data on
+        Garmin Connect for the given date (YYYY-MM-DD), regardless of whether
+        that data came from a real device or a previous shadow-sync upload.
+
+        Used to avoid uploading Fitbit data over a minute that is already
+        populated (by any source).  Falls back to an empty set on 403/error
+        so callers can continue safely without this check.
+        """
+        self._ensure_connected()
+        try:
+            url = f"/wellness-service/wellness/dailyHeartRate/{date}"
+            resp = self._client.connectapi(url)
+            values = resp.get("heartRateValues") or []
+            covered = set()
+            for v in values:
+                if v[1] is not None:  # skip null/gap entries
+                    # heartRateValues timestamps are in ms since Unix epoch
+                    dt = datetime.fromtimestamp(v[0] / 1000.0, tz=timezone.utc)
+                    # Truncate to the minute so we match FitbitClient's 1-min resolution
+                    covered.add(dt.replace(second=0, microsecond=0))
+            log.info("Garmin already has %d covered minute(s) for %s", len(covered), date)
+            return covered
+        except Exception as e:
+            log.info(
+                "Could not fetch existing Garmin HR data for %s "
+                "(wellness API unavailable, skipping coverage check): %s",
+                date, e,
+            )
+            return set()
+
+    def filter_covered_points(self, points: list[dict]) -> list[dict]:
+        """
+        Remove any points whose minute already has HR data on Garmin Connect.
+
+        This prevents uploading Fitbit data over any minute that's already
+        populated — whether from a real device sync or a previous shadow-sync
+        upload.  When the wellness API is unavailable (403), all points pass
+        through so the StateStore watermark acts as the fallback guard.
+        """
+        if not points:
+            return []
+
+        dates_needed = {p["datetime"].strftime("%Y-%m-%d") for p in points}
+        covered: set[datetime] = set()
+        for date in dates_needed:
+            covered |= self.get_covered_minutes(date)
+
+        if not covered:
+            return points
+
+        filtered = [
+            p for p in points
+            if p["datetime"].replace(second=0, microsecond=0) not in covered
+        ]
+        removed = len(points) - len(filtered)
+        if removed:
+            log.info("Skipping %d point(s) already present on Garmin Connect.", removed)
+        return filtered
 
     # ------------------------------------------------------------------
     # Upload
