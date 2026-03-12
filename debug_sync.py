@@ -10,7 +10,7 @@ sys.path.append(os.getcwd())
 
 from fitbit_client import FitbitClient
 from garmin_client import GarminClient
-from main import run_sync
+from main import run_sync, StateStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +45,8 @@ def main():
         log.info("Running sync (testing with 48h lookback)...")
         # Increase lookback for debug
         cfg["sync"]["lookback_hours"] = 48
-        run_sync(cfg, fitbit, garmin)
+        state = StateStore(os.path.join("data", "state.json"))
+        run_sync(cfg, fitbit, garmin, state)
         log.info("Debug sync cycle finished.")
     except Exception as e:
         log.exception("Debug sync failed: %s", e)

@@ -195,10 +195,14 @@ def build_monitoring_fit(
         raise ValueError("No data points provided")
 
     first_ts = to_garmin_ts(points[0]["datetime"])
+    # file_id.time_created should be when the file is created (now), not the
+    # first data point.  Garmin deduplicates on (serial_number, time_created),
+    # so using first_ts causes 409 Conflict on every retry for the same window.
+    file_created_ts = to_garmin_ts(datetime.now(timezone.utc))
 
     # Build message payload
     messages = b""
-    messages += _file_id_messages(manufacturer, product_id, serial_number, first_ts)
+    messages += _file_id_messages(manufacturer, product_id, serial_number, file_created_ts)
     messages += _device_info_messages(manufacturer, product_id, serial_number, first_ts, software_version)
     messages += _monitoring_info_message(first_ts, utc_offset_seconds)
     messages += _monitoring_messages(points)

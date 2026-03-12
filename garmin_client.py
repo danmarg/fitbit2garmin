@@ -159,6 +159,10 @@ class GarminClient:
         fit_bytes: bytes,
         window_start: datetime,
     ) -> dict:
+        # Include upload-time seconds in the filename so retries never collide with
+        # a previously uploaded file for the same window (Garmin returns 409 on
+        # filename re-use even when the content has changed).
         date_str = window_start.strftime("%Y-%m-%d")
-        filename = f"shadow_sync_{date_str}_{window_start.strftime('%H%M')}.fit"
+        upload_ts = datetime.now(timezone.utc).strftime("%H%M%S")
+        filename = f"shadow_{date_str}_{window_start.strftime('%H%M')}_{upload_ts}.fit"
         return self.upload_fit(fit_bytes, filename=filename)

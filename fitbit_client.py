@@ -10,6 +10,7 @@ import time
 import logging
 from datetime import datetime, timedelta, timezone
 
+import base64
 import requests
 from requests_oauthlib import OAuth2Session
 from requests_oauthlib.compliance_fixes import fitbit_compliance_fix
@@ -79,10 +80,47 @@ class FitbitClient:
         self._save_token(token)
         print("Authorization successful. Token saved.")
 
+    def _refresh_token(self):
+        """Refresh the Fitbit access token using Basic auth (required by Fitbit API).
+
+        requests-oauthlib's built-in auto_refresh sends credentials as form data,
+        but Fitbit requires them in the Authorization header as Basic base64(id:secret).
+        This method handles the refresh correctly and re-initialises the session.
+        """
+        token = self._load_token()
+        if not token or not token.get("refresh_token"):
+            log.warning("No refresh token available — re-authorization required.")
+            return
+        creds = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+        resp = requests.post(
+            TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {creds}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "refresh_token", "refresh_token": token["refresh_token"]},
+        )
+        resp.raise_for_status()
+        new_token = resp.json()
+        new_token["expires_at"] = time.time() + new_token["expires_in"]
+        self._save_token(new_token)
+        # Re-init session so subsequent requests use the new access token.
+        self.session = self._init_session()
+        log.info("Fitbit access token refreshed successfully.")
+
+    def _ensure_token_fresh(self):
+        """Proactively refresh the token if it is expired or about to expire."""
+        token = self._load_token()
+        if token and time.time() > token.get("expires_at", 0) - 60:
+            log.info("Fitbit token expired or expiring soon — refreshing…")
+            self._refresh_token()
+
     def ensure_authorized(self):
-        """Authorize if no token exists yet."""
+        """Authorize if no token exists yet, otherwise refresh if expired."""
         if not os.path.exists(TOKEN_FILE):
             self.authorize()
+        else:
+            self._ensure_token_fresh()
 
     # ------------------------------------------------------------------
     # Data fetching
