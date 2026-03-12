@@ -116,6 +116,18 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.warning("No Fitbit data returned for the last %dh — skipping.", lookback)
         return
 
+    # Build a steps-since-local-midnight map from the FULL dataset before any filtering.
+    # This lets us correctly offset the cumulative step counter in each FIT segment so
+    # that Garmin sees cycles counting up from 0 at midnight — matching real device
+    # behaviour — rather than restarting from 0 at the start of each uploaded window.
+    local_offset = timedelta(seconds=utc_offset_seconds)
+    _date_running: dict = {}
+    steps_since_midnight: dict[datetime, int] = {}
+    for pt in points:                           # points is already sorted ascending
+        local_date = (pt["datetime"] + local_offset).date()
+        _date_running[local_date] = _date_running.get(local_date, 0) + pt.get("steps_delta", 0)
+        steps_since_midnight[pt["datetime"]] = _date_running[local_date]
+
     # 2. Apply recency buffer: hold back data newer than recency_minutes.
     #    This gives the real Garmin device time to sync its own data first,
     #    so the coverage check below can see it and skip those minutes.
@@ -164,11 +176,14 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
 
     # 6. Build + upload one FIT file per segment
     for i, seg in enumerate(segments, 1):
-        # Reset cumulative steps for this segment to start at 0
-        current_cumulative = 0
+        # Assign cumulative steps using the full-dataset midnight-relative map so that
+        # cycles in the FIT file count up from 0 at local midnight (matching real device
+        # behaviour).  When the segment crosses midnight the counter resets automatically
+        # because the map is keyed by local date.  For points not in the map (shouldn't
+        # happen in practice) fall back to the point's existing cumulative_steps value.
         for pt in seg:
-            current_cumulative += pt.get("steps_delta", 0)
-            pt["cumulative_steps"] = current_cumulative
+            pt["cumulative_steps"] = steps_since_midnight.get(pt["datetime"],
+                                                               pt.get("cumulative_steps", 0))
 
         window_start = seg[0]["datetime"]
         window_end = seg[-1]["datetime"]
