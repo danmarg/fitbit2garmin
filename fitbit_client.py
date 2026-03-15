@@ -43,11 +43,9 @@ class FitbitClient:
             redirect_uri="http://localhost:8080/",
             scope=["heartrate", "activity", "profile"],
             token=token,
-            auto_refresh_url=TOKEN_URL,
-            auto_refresh_kwargs={
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-            },
+            # We handle refresh manually in _ensure_token_fresh to ensure
+            # the correct Basic Auth headers are sent, which auto_refresh
+            # often gets wrong for Fitbit.
             token_updater=self._save_token,
         )
         fitbit_compliance_fix(session)
@@ -56,12 +54,18 @@ class FitbitClient:
     def _load_token(self) -> dict | None:
         if os.path.exists(TOKEN_FILE):
             with open(TOKEN_FILE) as f:
-                return json.load(f)
+                token = json.load(f)
+                if token:
+                    log.debug("Loaded token from %s. Fields: %s", TOKEN_FILE, list(token.keys()))
+                return token
         return None
 
     def _save_token(self, token: dict):
+        """Save the token to disk, merging with existing data to preserve refresh_tokens."""
+        existing = self._load_token() or {}
+        existing.update(token)
         with open(TOKEN_FILE, "w") as f:
-            json.dump(token, f, indent=2)
+            json.dump(existing, f, indent=2)
         log.debug("Token saved to %s", TOKEN_FILE)
 
     def authorize(self):
@@ -100,6 +104,8 @@ class FitbitClient:
             },
             data={"grant_type": "refresh_token", "refresh_token": token["refresh_token"]},
         )
+        if resp.status_code != 200:
+            log.error("Fitbit token refresh failed: %d %s", resp.status_code, resp.text)
         resp.raise_for_status()
         new_token = resp.json()
         new_token["expires_at"] = time.time() + new_token["expires_in"]
