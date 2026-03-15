@@ -186,12 +186,16 @@ class FitbitClient:
         cutoff_utc = now_utc - timedelta(hours=lookback_hours)
 
         # Generate all dates (in local time) that might contain our UTC window
-        # We look at 'now' and 'cutoff' in the user's local time.
         now_local = now_utc.astimezone(local_tz)
         cutoff_local = cutoff_utc.astimezone(local_tz)
 
+        # To ensure cumulative_steps reflects steps-since-midnight, we must fetch 
+        # from the start of the earliest day in our lookback window.
+        start_of_day_local = cutoff_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day_local.astimezone(timezone.utc)
+
         dates_needed = []
-        curr_d = cutoff_local.date()
+        curr_d = start_of_day_local.date()
         while curr_d <= now_local.date():
             dates_needed.append(curr_d)
             curr_d += timedelta(days=1)
@@ -223,15 +227,29 @@ class FitbitClient:
             except Exception as e:
                 log.warning("Could not fetch steps data for %s: %s", date_str, e)
 
-        # Merge and filter to the lookback window (UTC)
+        # Merge and calculate cumulative steps from the start of the earliest day
         all_times = sorted(set(hr_by_minute) | set(steps_by_minute))
         merged = []
         cumulative_steps = 0
+        current_local_date = None
+        
         for dt in all_times:
-            if dt < cutoff_utc or dt > now_utc:
+            # We must process ALL points from start_of_day_utc to compute cumulative_steps
+            # but only append to merged if they are within our lookback window.
+            if dt < start_of_day_utc:
                 continue
+                
+            local_dt = dt.astimezone(local_tz)
+            if local_dt.date() != current_local_date:
+                current_local_date = local_dt.date()
+                cumulative_steps = 0 # Reset at local midnight
+                
             steps_delta = steps_by_minute.get(dt, 0)
             cumulative_steps += steps_delta
+            
+            if dt < cutoff_utc or dt > now_utc:
+                continue
+                
             merged.append(
                 {
                     "datetime": dt,

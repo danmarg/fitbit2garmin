@@ -147,12 +147,18 @@ def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0, activity_type
 def _monitoring_messages(points: list[dict]) -> bytes:
     """
     Emit monitoring definition + one data record per intraday point.
-    points: [{"datetime": datetime, "heart_rate": int, "cumulative_steps": int}, ...]
+    points: [{"datetime": datetime, "heart_rate": int, "cumulative_steps": int, "steps_delta": int}, ...]
     """
-    # 253: timestamp, 3: cycles (steps*2), 27: heart_rate
+    # 253: timestamp (4, UINT32)
+    # 3: cycles (4, UINT32) - cumulative steps * 2
+    # 30: duration (4, UINT32) - duration of this interval in seconds
+    # 5: activity_type (1, UINT8) - 6 = walking (makes field 3 represent steps)
+    # 27: heart_rate (1, UINT8)
     defn = _definition_record(3, MESG_NUM_MONITORING, [
         (253, 4, UINT32),
         (3,   4, UINT32),
+        (30,  4, UINT32),
+        (5,   1, UINT8),
         (27,  1, UINT8),
     ])
     records = defn
@@ -160,9 +166,15 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         ts = to_garmin_ts(pt["datetime"])
         hr = max(0, min(255, pt.get("heart_rate", 0)))
         # In Monitoring files, 'cycles' is often used for steps and is defined as 2 cycles per step
-        steps = pt.get("cumulative_steps", 0)
-        cycles = steps * 2
-        records += _data_record(3, [ts, cycles, hr], "IIB")
+        steps_cum = pt.get("cumulative_steps", 0)
+        cycles = steps_cum * 2
+        # 1-minute resolution (60 seconds)
+        duration = 60
+        # Activity type 6 (walking) or 1 (running) makes Garmin see 'cycles' as steps.
+        # We use 6 for any interval with steps.
+        activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
+        
+        records += _data_record(3, [ts, cycles, duration, activity_type, hr], "IIIBB")
     return records
 
 

@@ -73,7 +73,9 @@ class TestFitGeneration(unittest.TestCase):
             print(f"  {field.name} ({field.def_num}): {field.value}")
             
         self.assertEqual(first_msg.get_value("heart_rate"), 70)
-        self.assertEqual(first_msg.get_value("cycles"), 10)
+        self.assertEqual(first_msg.get_value("steps"), 20)
+        self.assertEqual(first_msg.get_value("duration"), 60)
+        self.assertEqual(first_msg.get_value("activity_type"), "walking")
 
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
 
@@ -111,8 +113,7 @@ class TestLocalTimestamp(unittest.TestCase):
         msg = self._parse_monitoring_info(fit_bytes)
         ts = msg.get_value("timestamp")
         local_ts = msg.get_value("local_timestamp")
-        # fitparse returns Garmin-epoch ints; the difference must equal the offset
-        self.assertEqual(local_ts - ts, 3600)
+        self.assertEqual((local_ts - ts).total_seconds(), 3600)
 
     def test_local_timestamp_negative_offset(self):
         """UTC-5 (-18000 s) → local_timestamp is 18000 s behind timestamp."""
@@ -121,7 +122,7 @@ class TestLocalTimestamp(unittest.TestCase):
         msg = self._parse_monitoring_info(fit_bytes)
         ts = msg.get_value("timestamp")
         local_ts = msg.get_value("local_timestamp")
-        self.assertEqual(local_ts - ts, -18000)
+        self.assertEqual((local_ts - ts).total_seconds(), -18000)
 
 
 class TestSplitSegments(unittest.TestCase):
