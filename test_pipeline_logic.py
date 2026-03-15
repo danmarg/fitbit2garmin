@@ -125,6 +125,13 @@ class TestLocalTimestamp(unittest.TestCase):
         self.assertEqual((local_ts - ts).total_seconds(), -18000)
 
 
+    def test_monitoring_info_activity_type(self):
+        """Verify monitoring_info has activity_type=walking (6)."""
+        points = self._make_points()
+        fit_bytes = build_monitoring_fit(points, 1, 3993, 12345, utc_offset_seconds=0)
+        msg = self._parse_monitoring_info(fit_bytes)
+        self.assertEqual(msg.get_value("activity_type"), "walking")
+
 class TestSplitSegments(unittest.TestCase):
     """Unit tests for the contiguous-segment splitter in main.py."""
 

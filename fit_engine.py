@@ -128,7 +128,7 @@ def _device_info_messages(manufacturer: int, product_id: int, serial_number: int
     return defn + data
 
 
-def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0, activity_type: int = 0) -> bytes:
+def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0) -> bytes:
     """Emit monitoring_info definition + data (local mesg 2).
 
     local_timestamp = Garmin UTC timestamp + local UTC offset in seconds.
@@ -140,7 +140,9 @@ def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0, activity_type
         (1,   1, UINT8),   # activity_type
     ])
     local_ts = ts + utc_offset_seconds
-    data = _data_record(2, [ts, local_ts, activity_type], "IIB")
+    # Use activity_type=6 (walking) to match the monitoring messages.
+    # This tells Garmin the entire file contains walking/wellness data.
+    data = _data_record(2, [ts, local_ts, 6], "IIB")
     return defn + data
 
 
@@ -170,9 +172,10 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         cycles = steps_cum * 2
         # 1-minute resolution (60 seconds)
         duration = 60
-        # Activity type 6 (walking) or 1 (running) makes Garmin see 'cycles' as steps.
-        # We use 6 for any interval with steps.
-        activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
+        # Always use activity_type=6 (walking). This ensures that cumulative steps (cycles)
+        # are correctly interpreted as steps and that heart rate data is consistently
+        # associated with a valid wellness record.
+        activity_type = 6
         
         records += _data_record(3, [ts, cycles, duration, activity_type, hr], "IIIBB")
     return records
