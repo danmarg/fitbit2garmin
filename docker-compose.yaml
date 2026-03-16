@@ -1,6 +1,6 @@
 services:
   shadow-sync:
-    user: "1000:1000"
+    user: "${UID}:${GID}"
     build: .
     container_name: shadow-sync
     restart: unless-stopped
