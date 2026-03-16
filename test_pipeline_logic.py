@@ -62,20 +62,27 @@ class TestFitGeneration(unittest.TestCase):
         self.assertIn(file_id.get_value("type"), ["monitoring", "monitoring_a", "monitoring_b", "monitoring_daily", "activity"])
         self.assertEqual(file_id.get_value("product"), product_id)
 
-        # Verify Monitoring Messages
+        # Verify Monitoring Messages: 2 records per point (activity + HR)
         monitoring_msgs = list(fitfile.get_messages("monitoring"))
-        self.assertEqual(len(monitoring_msgs), 120)
-        
-        # Check first record
-        first_msg = monitoring_msgs[0]
-        print("\nDebug: Fields found in monitoring message:")
-        for field in first_msg:
+        self.assertEqual(len(monitoring_msgs), 240)
+
+        # Activity records have steps + activity_type, no heart_rate.
+        # HR records have heart_rate only — Garmin ignores HR when activity_type is
+        # in the same record, so they must be separate.
+        activity_msgs = [m for m in monitoring_msgs if m.get_value("activity_type") is not None]
+        hr_msgs = [m for m in monitoring_msgs if m.get_value("heart_rate") is not None]
+        self.assertEqual(len(activity_msgs), 120)
+        self.assertEqual(len(hr_msgs), 120)
+
+        first_activity = activity_msgs[0]
+        print("\nDebug: Fields found in first activity monitoring message:")
+        for field in first_activity:
             print(f"  {field.name} ({field.def_num}): {field.value}")
-            
-        self.assertEqual(first_msg.get_value("heart_rate"), 70)
-        self.assertEqual(first_msg.get_value("steps"), 20)
-        self.assertEqual(first_msg.get_value("duration"), 60)
-        self.assertEqual(first_msg.get_value("activity_type"), "walking")
+
+        self.assertEqual(first_activity.get_value("steps"), 20)
+        self.assertEqual(first_activity.get_value("activity_type"), "walking")
+        self.assertIsNone(first_activity.get_value("heart_rate"))
+        self.assertEqual(hr_msgs[0].get_value("heart_rate"), 70)
 
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
 

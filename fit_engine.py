@@ -148,35 +148,35 @@ def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0) -> bytes:
 
 def _monitoring_messages(points: list[dict]) -> bytes:
     """
-    Emit monitoring definition + one data record per intraday point.
+    Emit monitoring definitions + two records per intraday point.
     points: [{"datetime": datetime, "heart_rate": int, "cumulative_steps": int, "steps_delta": int}, ...]
+
+    Real Garmin devices emit separate monitoring records for activity/steps vs heart rate.
+    When activity_type is present in a monitoring record, Garmin treats it as an activity
+    summary and ignores heart_rate in the same record. HR must be in its own record.
+
+    Local mesg 3: activity record — timestamp + cycles + activity_type (steps data)
+    Local mesg 4: HR record      — timestamp + heart_rate (no activity_type)
     """
-    # 253: timestamp (4, UINT32)
-    # 3: cycles (4, UINT32) - cumulative steps * 2
-    # 30: duration (4, UINT32) - duration of this interval in seconds
-    # 5: activity_type (1, UINT8) - 6 = walking (makes field 3 represent steps)
-    # 27: heart_rate (1, UINT8)
-    defn = _definition_record(3, MESG_NUM_MONITORING, [
-        (253, 4, UINT32),
-        (3,   4, UINT32),
-        (30,  4, UINT32),
-        (5,   1, UINT8),
-        (27,  1, UINT8),
+    defn_activity = _definition_record(3, MESG_NUM_MONITORING, [
+        (253, 4, UINT32),  # timestamp
+        (3,   4, UINT32),  # cycles (cumulative steps * 2)
+        (5,   1, UINT8),   # activity_type (6=walking makes cycles represent steps)
     ])
-    records = defn
+    defn_hr = _definition_record(4, MESG_NUM_MONITORING, [
+        (253, 4, UINT32),  # timestamp
+        (27,  1, UINT8),   # heart_rate
+    ])
+    records = defn_activity + defn_hr
     for pt in points:
         ts = to_garmin_ts(pt["datetime"])
         hr = max(0, min(255, pt.get("heart_rate", 0)))
-        # In Monitoring files, 'cycles' is often used for steps and is defined as 2 cycles per step
         steps_cum = pt.get("cumulative_steps", 0)
         cycles = steps_cum * 2
-        # 1-minute resolution (60 seconds)
-        duration = 60
-        # Only use walking (6) when there are actually steps. 
-        # Generic (0) for pure HR minutes allows them to show in the daily timeline.
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
-        
-        records += _data_record(3, [ts, cycles, duration, activity_type, hr], "IIIBB")
+
+        records += _data_record(3, [ts, cycles, activity_type], "IIB")
+        records += _data_record(4, [ts, hr], "IB")
     return records
 
 
