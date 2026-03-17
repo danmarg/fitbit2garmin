@@ -1,4 +1,4 @@
-# Shadow Sync
+# Fitbit2Garmin
 
 Pulls Fitbit intraday heart rate and step data and injects it into Garmin Connect as `monitoring_b` FIT files, impersonating your registered Garmin device. This populates 24/7 HR data in Garmin Connect, which feeds Training Load, Suggested Workouts, and Physio TrueUp calculations.
 
