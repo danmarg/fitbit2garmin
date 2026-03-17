@@ -176,7 +176,8 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
-        records += _data_record(4, [ts, hr], "IB")
+        # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
+        records += _data_record(4, [ts + 1, hr], "IB")
     return records
 
 
