@@ -157,10 +157,12 @@ def _monitoring_messages(points: list[dict]) -> bytes:
 
     Local mesg 3: activity record — timestamp + cycles + activity_type (steps data)
     Local mesg 4: HR record      — timestamp + heart_rate (no activity_type)
+
+    Cycles are cumulative WITHIN THIS SEGMENT ONLY, not from start of day.
     """
     defn_activity = _definition_record(3, MESG_NUM_MONITORING, [
         (253, 4, UINT32),  # timestamp
-        (3,   4, UINT32),  # cycles (cumulative steps * 2)
+        (3,   4, UINT32),  # cycles (cumulative steps * 2, within segment)
         (5,   1, UINT8),   # activity_type (6=walking makes cycles represent steps)
     ])
     defn_hr = _definition_record(4, MESG_NUM_MONITORING, [
@@ -168,11 +170,16 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         (27,  1, UINT8),   # heart_rate
     ])
     records = defn_activity + defn_hr
+
+    # Calculate segment-relative cumulative steps (reset at segment start)
+    segment_start_cumulative = points[0].get("cumulative_steps", 0) if points else 0
+
     for pt in points:
         ts = to_garmin_ts(pt["datetime"])
         hr = max(0, min(255, pt.get("heart_rate", 0)))
-        steps_cum = pt.get("cumulative_steps", 0)
-        cycles = steps_cum * 2
+        # Segment-relative cumulative: steps accumulated within this segment only
+        steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
+        cycles = steps_cum_in_segment * 2
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
