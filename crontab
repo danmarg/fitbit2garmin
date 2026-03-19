@@ -1,10 +1,10 @@
 # Fitbit2Garmin crontab (for Docker container)
-# Runs the Fitbit-to-Garmin sync every 2 hours
+# Runs the Fitbit-to-Garmin sync every hour
 #
 # For system cron (outside Docker), use install_cron.sh instead:
-#   ./install_cron.sh [--frequency "0 */2 * * *"]
+#   ./install_cron.sh [--frequency "0 * * * *"]
 #
 # Paths are Docker-specific (/app = WORKDIR in Dockerfile).
 # System cron will use paths relative to the project directory.
 
-0 */2 * * * cd /app && python main.py >> /app/data/cron.log 2>&1
+0 * * * * cd /app && python main.py >> /app/data/cron.log 2>&1

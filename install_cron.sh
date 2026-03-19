@@ -1,14 +1,14 @@
 #!/bin/bash
 # install_cron.sh - Install Fitbit2Garmin to system crontab
 # Usage: ./install_cron.sh [--frequency "0 */2 * * *"]
-# Default frequency: every 2 hours (0 */2 * * *)
+# Default frequency: every hour (0 * * * *)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 VENV_DIR="${PROJECT_DIR}/.venv"
-FREQUENCY="${1:-0 */2 * * *}"
+FREQUENCY="${1:-0 * * * *}"
 LOG_DIR="${PROJECT_DIR}/logs"
 
 # Ensure log directory exists
