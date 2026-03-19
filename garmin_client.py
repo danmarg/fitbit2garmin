@@ -71,7 +71,7 @@ class GarminClient:
         """
         Return the set of UTC minute-datetimes that already have HR data on
         Garmin Connect for the given date (YYYY-MM-DD), regardless of whether
-        that data came from a real device or a previous shadow-sync upload.
+        that data came from a real device or a previous fitbit2garmin upload.
 
         Used to avoid uploading Fitbit data over a minute that is already
         populated (by any source).  Falls back to an empty set on 403/error
@@ -104,7 +104,7 @@ class GarminClient:
         Remove any points whose minute already has HR data on Garmin Connect.
 
         This prevents uploading Fitbit data over any minute that's already
-        populated — whether from a real device sync or a previous shadow-sync
+        populated — whether from a real device sync or a previous fitbit2garmin
         upload.  When the wellness API is unavailable (403), all points pass
         through so the StateStore watermark acts as the fallback guard.
         """
@@ -164,5 +164,5 @@ class GarminClient:
         # filename re-use even when the content has changed).
         date_str = window_start.strftime("%Y-%m-%d")
         upload_ts = datetime.now(timezone.utc).strftime("%H%M%S")
-        filename = f"shadow_{date_str}_{window_start.strftime('%H%M')}_{upload_ts}.fit"
+        filename = f"fitbit2garmin_{date_str}_{window_start.strftime('%H%M')}_{upload_ts}.fit"
         return self.upload_fit(fit_bytes, filename=filename)

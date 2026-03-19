@@ -1,11 +1,11 @@
-# Shadow Sync (Fitbit to Garmin)
+# Fitbit2Garmin (Fitbit to Garmin)
 
 A specialized synchronization tool that bridges the gap between Fitbit and Garmin ecosystems by injecting high-resolution Fitbit intraday data (heart rate and steps) into Garmin Connect.
 
 ## Project Overview
 
 **Purpose:**
-Shadow Sync pulls 1-minute resolution heart rate and step data from the Fitbit Web API and encodes it into Garmin `monitoring_b` (Type 9) FIT files. By impersonating a registered Garmin device, this data is accepted by Garmin Connect as native "wellness" data, which in turn populates metrics like **Training Load**, **Daily Suggested Workouts**, and **Physio TrueUp**—features usually reserved for data recorded directly on Garmin wearables.
+Fitbit2Garmin pulls 1-minute resolution heart rate and step data from the Fitbit Web API and encodes it into Garmin `monitoring_b` (Type 9) FIT files. By impersonating a registered Garmin device, this data is accepted by Garmin Connect as native "wellness" data, which in turn populates metrics like **Training Load**, **Daily Suggested Workouts**, and **Physio TrueUp**—features usually reserved for data recorded directly on Garmin wearables.
 
 **Core Technologies:**
 - **Python 3.11+**: The primary runtime.
@@ -52,17 +52,17 @@ Shadow Sync pulls 1-minute resolution heart rate and step data from the Fitbit W
 ### Running with Docker
 1.  **Build Image:**
     ```bash
-    docker build -t shadow-sync .
+    docker build -t fitbit2garmin .
     ```
 2.  **Run Container:**
     ```bash
     docker run -d \
-      --name shadow-sync \
+      --name fitbit2garmin \
       --restart unless-stopped \
       -v /path/to/data:/app/data \
       -e CONFIG_FILE=/app/data/config.yaml \
       -e GARTH_HOME=/app/data/garth \
-      shadow-sync
+      fitbit2garmin
     ```
 
 ### Testing
@@ -80,5 +80,5 @@ pytest test_pipeline_logic.py -v
 - **Collision Avoidance**:
   - **Recency Buffer**: Data newer than 60 minutes (configurable) is held back to allow real Garmin devices to sync first.
   - **Coverage Check**: Before uploading, the tool queries Garmin's wellness API to check for existing data points, skipping any minutes already populated.
-- **Logging**: Use the `shadow_sync` logger. All sync cycles, uploads, and errors should be logged with appropriate levels (`INFO`, `WARNING`, `ERROR`).
+- **Logging**: Use the `fitbit2garmin` logger. All sync cycles, uploads, and errors should be logged with appropriate levels (`INFO`, `WARNING`, `ERROR`).
 - **FIT File Identity**: The filename of uploaded FIT files includes the window start time and a unique timestamp to prevent 409 Conflict errors from Garmin on retries.

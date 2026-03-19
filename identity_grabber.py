@@ -1,7 +1,7 @@
 """
 identity_grabber.py
 Utility to extract manufacturer, product_id, and serial_number from a real
-Garmin .fit file so Shadow Sync can impersonate the same device.
+Garmin .fit file so Fitbit2Garmin can impersonate the same device.
 
 Usage:
     python identity_grabber.py path/to/activity.fit

@@ -9,6 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
+# Run a single sync cycle (for cron/systemd/manual execution)
+python main.py
+
 # Run all tests
 pytest test_pipeline_logic.py -v
 
@@ -22,9 +25,12 @@ python debug_sync.py
 # Extract Garmin device identity from a real wellness FIT file
 python identity_grabber.py path/to/WELLNESS.fit
 
-# Docker
+# Docker (cron-based, runs every 2 hours)
 docker compose up -d
 docker compose logs -f
+
+# System cron (outside Docker) — add to crontab
+# 0 */2 * * * cd /path/to/fitbit2garmin && python main.py >> logs/cron.log 2>&1
 ```
 
 ## Architecture
@@ -49,24 +55,34 @@ Fitbit API (1-min HR + steps)
 
 | File | Role |
 |------|------|
-| `main.py` | Orchestration loop, `StateStore`, `split_segments`, `run_sync` |
+| `main.py` | Single sync cycle orchestration: `StateStore`, `split_segments`, `run_sync`. Runs once and exits (looping controlled by cron/systemd) |
 | `fit_engine.py` | Binary FIT encoder — builds header, definition/data records, CRC checksums |
 | `fitbit_client.py` | OAuth2 auth, intraday fetch, wall-clock → UTC conversion |
 | `garmin_client.py` | garth session mgmt, wellness coverage check, FIT upload |
 | `identity_grabber.py` | Extracts manufacturer/product/serial/software_version from a real FIT file |
 | `debug_sync.py` | Single-shot runner for manual testing |
+| `crontab` | Cron schedule for Docker container (runs every 2 hours) |
 
 ### Configuration
 
 Copy `config.yaml.example` → `config.yaml` (git-ignored). Key settings under `sync:`:
 - `lookback_hours` — how far back to fetch from Fitbit (default 4)
-- `interval_minutes` — sync frequency (default 120)
 - `recency_minutes` — hold-back buffer so a real Garmin device can sync first (default 60)
 - `hooks.on_success` / `hooks.on_failure` — optional shell commands (e.g. healthchecks.io)
 
 Environment variables:
 - `CONFIG_FILE` — path to config.yaml (default: `data/config.yaml`)
 - `GARTH_HOME` — garth session cache directory (default: `~/.garth`; Docker uses `/app/data/garth`)
+
+### Execution model
+
+**main.py now runs a single sync cycle and exits.** Looping is controlled externally:
+
+- **Docker**: Cron (in the container, defined in `crontab`) runs `main.py` on a schedule. Default: every 2 hours.
+- **System cron** (outside Docker): Add an entry to your crontab to run `python main.py` at your desired frequency.
+- **systemd**: Use a systemd timer to trigger the script periodically.
+
+To customize the Docker schedule, edit `crontab` before building the image, or override `CMD` in `docker-compose.yaml` to use systemd instead of cron.
 
 ### Deduplication layers (in order)
 

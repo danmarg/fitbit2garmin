@@ -1,8 +1,8 @@
 services:
-  shadow-sync:
+  fitbit2garmin:
     user: "${UID}:${GID}"
     build: .
-    container_name: shadow-sync
+    container_name: fitbit2garmin
     restart: unless-stopped
     volumes:
       - ./data:/app/data

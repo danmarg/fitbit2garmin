@@ -118,36 +118,36 @@ The container runs the sync loop continuously (`interval_minutes` from config.ya
 ### Build
 
 ```bash
-docker build -t shadow-sync .
+docker build -t fitbit2garmin .
 ```
 
 ### Prepare the data directory
 
 ```bash
-mkdir -p /opt/shadow-sync/data
-cp config.yaml /opt/shadow-sync/data/config.yaml
-cp token.json  /opt/shadow-sync/data/token.json   # from the auth step above
+mkdir -p /opt/fitbit2garmin/data
+cp config.yaml /opt/fitbit2garmin/data/config.yaml
+cp token.json  /opt/fitbit2garmin/data/token.json   # from the auth step above
 
 # Copy your existing Garmin session (from garth login, usually at ~/.garth)
-cp -r ~/.garth /opt/shadow-sync/data/garth
+cp -r ~/.garth /opt/fitbit2garmin/data/garth
 ```
 
 ### Run
 
 ```bash
 docker run -d \
-  --name shadow-sync \
+  --name fitbit2garmin \
   --restart unless-stopped \
-  -v /opt/shadow-sync/data:/app/data \
+  -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
   -e GARTH_HOME=/app/data/garth \
-  shadow-sync
+  fitbit2garmin
 ```
 
 View logs:
 
 ```bash
-docker logs -f shadow-sync
+docker logs -f fitbit2garmin
 ```
 
 ### Host Cron (alternative to the built-in loop)
@@ -160,10 +160,10 @@ crontab -e
 
 ```cron
 0 */2 * * * docker run --rm \
-  -v /opt/shadow-sync/data:/app/data \
+  -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
   -e GARTH_HOME=/app/data/garth \
-  shadow-sync python debug_sync.py >> /var/log/shadow-sync.log 2>&1
+  fitbit2garmin python debug_sync.py >> /var/log/fitbit2garmin.log 2>&1
 ```
 
 ---

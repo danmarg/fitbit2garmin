@@ -1,6 +1,6 @@
 """
 main.py
-Shadow Sync orchestration loop.
+Fitbit2Garmin orchestration loop.
 Pulls Fitbit intraday data, encodes a Garmin Monitoring FIT file, and uploads it.
 """
 
@@ -9,7 +9,6 @@ import logging
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 
 import yaml
@@ -23,7 +22,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("shadow_sync")
+log = logging.getLogger("fitbit2garmin")
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join("data", "config.yaml"))
 STATE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "state.json")
@@ -102,7 +101,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
 
 def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: StateStore):
     """Execute one full sync cycle."""
-    log.info("=== Shadow Sync cycle starting ===")
+    log.info("=== Fitbit2Garmin cycle starting ===")
 
     lookback = cfg["sync"].get("lookback_hours", 4)
     recency_minutes = cfg["sync"].get("recency_minutes", 60)
@@ -147,7 +146,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         return
 
     # 4. Skip any minute already populated on Garmin (from any source —
-    #    real device or a previous shadow upload).  This prevents overwriting
+    #    real device or a previous fitbit2garmin upload).  This prevents overwriting
     #    data that beat us to Garmin, while the recency buffer makes it likely
     #    that real-device data arrived first for recent minutes.
     points = garmin.filter_covered_points(points)
@@ -189,7 +188,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
     if last_point_uploaded is not None:
         state.save_last_uploaded(last_point_uploaded)
 
-    log.info("=== Shadow Sync cycle done ===")
+    log.info("=== Fitbit2Garmin cycle done ===")
 
 
 def main():
@@ -206,23 +205,17 @@ def main():
     )
     garmin.connect()
 
-    interval_minutes = cfg["sync"].get("interval_minutes", 120)
-    interval_seconds = interval_minutes * 60
-
-    log.info("Shadow Sync started. Interval: %d minutes.", interval_minutes)
+    log.info("Fitbit2Garmin starting single sync cycle.")
 
     hooks = cfg.get("sync", {}).get("hooks", {})
 
-    while True:
-        try:
-            run_sync(cfg, fitbit, garmin, state)
-            run_hook(hooks.get("on_success"))
-        except Exception as e:
-            log.exception("Sync cycle failed: %s", e)
-            run_hook(hooks.get("on_failure"))
-
-        log.info("Sleeping %d minutes until next sync…", interval_minutes)
-        time.sleep(interval_seconds)
+    try:
+        run_sync(cfg, fitbit, garmin, state)
+        run_hook(hooks.get("on_success"))
+    except Exception as e:
+        log.exception("Sync cycle failed: %s", e)
+        run_hook(hooks.get("on_failure"))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

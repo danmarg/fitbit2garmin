@@ -1,4 +1,4 @@
-# Shadow Sync Configuration
+# Fitbit2Garmin Configuration
 # Copy this to config.yaml and fill in your values.
 
 fitbit:
@@ -21,7 +21,6 @@ device:
 
 sync:
   lookback_hours: 4     # How many hours back to pull from Fitbit
-  interval_minutes: 120 # How often to run the sync loop
   recency_minutes: 60   # Don't upload data newer than this many minutes;
                         # gives the real Garmin device time to sync first
   hooks:
