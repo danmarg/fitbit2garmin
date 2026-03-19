@@ -179,7 +179,7 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         hr = max(0, min(255, pt.get("heart_rate", 0)))
         # Segment-relative cumulative: steps accumulated within this segment only
         steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
-        cycles = steps_cum_in_segment * 2
+        cycles = max(0, steps_cum_in_segment * 2)
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
