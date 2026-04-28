@@ -7,6 +7,7 @@ binary FIT files via the device sync endpoint.
 import io
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import garth
@@ -141,18 +142,25 @@ class GarminClient:
         self._ensure_connected()
 
         upload_url = "/upload-service/upload"
-        files = {
-            "file": (filename, io.BytesIO(fit_bytes), "application/octet-stream")
-        }
+        _MAX_ATTEMPTS = 3
 
-        log.info("Uploading %d-byte FIT file to Garmin (%s)…", len(fit_bytes), filename)
-        resp = self._client.connectapi(
-            upload_url,
-            method="POST",
-            files=files,
-        )
-        log.info("Garmin upload response: %s", resp)
-        return resp
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            files = {"file": (filename, io.BytesIO(fit_bytes), "application/octet-stream")}
+            log.info("Uploading %d-byte FIT file to Garmin (%s)…", len(fit_bytes), filename)
+            try:
+                resp = self._client.connectapi(upload_url, method="POST", files=files)
+                log.info("Garmin upload response: %s", resp)
+                return resp
+            except Exception as e:
+                if attempt < _MAX_ATTEMPTS:
+                    delay = 5 * attempt  # 5 s, 10 s
+                    log.warning(
+                        "Garmin upload attempt %d/%d failed (%s) — retrying in %ds…",
+                        attempt, _MAX_ATTEMPTS, e, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
 
     def upload_fit_for_window(
         self,

@@ -159,8 +159,6 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
     segments = split_segments(points)
     log.info("%d contiguous segment(s) to upload.", len(segments))
 
-    last_point_uploaded: datetime | None = None
-
     # 6. Build + upload one FIT file per segment
     for i, seg in enumerate(segments, 1):
         window_start = seg[0]["datetime"]
@@ -182,11 +180,10 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         )
         result = garmin.upload_fit_for_window(fit_bytes, window_start)
         log.info("Upload complete: %s", result)
-        last_point_uploaded = window_end
-
-    # 7. Persist the watermark so the next cycle skips these points.
-    if last_point_uploaded is not None:
-        state.save_last_uploaded(last_point_uploaded)
+        # 7. Advance the watermark immediately after each successful upload so
+        #    that if a later segment fails, already-uploaded segments are skipped
+        #    by the watermark on the next cycle (not just by the coverage check).
+        state.save_last_uploaded(window_end)
 
     log.info("=== Fitbit2Garmin cycle done ===")
 

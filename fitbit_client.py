@@ -96,17 +96,29 @@ class FitbitClient:
             log.warning("No refresh token available — re-authorization required.")
             return
         creds = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
-        resp = requests.post(
-            TOKEN_URL,
-            headers={
-                "Authorization": f"Basic {creds}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={"grant_type": "refresh_token", "refresh_token": token["refresh_token"]},
-        )
-        if resp.status_code != 200:
-            log.error("Fitbit token refresh failed: %d %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+        _TRANSIENT = {429, 500, 502, 503, 504}
+        _MAX_ATTEMPTS = 3
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            resp = requests.post(
+                TOKEN_URL,
+                headers={
+                    "Authorization": f"Basic {creds}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={"grant_type": "refresh_token", "refresh_token": token["refresh_token"]},
+            )
+            if resp.status_code == 200:
+                break
+            if resp.status_code in _TRANSIENT and attempt < _MAX_ATTEMPTS:
+                delay = 5 * attempt  # 5 s, 10 s
+                log.warning(
+                    "Fitbit token refresh attempt %d/%d failed (%d) — retrying in %ds…",
+                    attempt, _MAX_ATTEMPTS, resp.status_code, delay,
+                )
+                time.sleep(delay)
+            else:
+                log.error("Fitbit token refresh failed: %d %s", resp.status_code, resp.text)
+                resp.raise_for_status()
         new_token = resp.json()
         new_token["expires_at"] = time.time() + new_token["expires_in"]
         self._save_token(new_token)
