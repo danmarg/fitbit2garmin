@@ -1,6 +1,6 @@
 """
 garmin_client.py
-Wraps the garth library to authenticate with Garmin Connect and upload
+Wraps the garminconnect library to authenticate with Garmin Connect and upload
 binary FIT files via the device sync endpoint.
 """
 
@@ -10,19 +10,19 @@ import os
 import time
 from datetime import datetime, timezone
 
-import garth
+from garminconnect import Garmin
 
 log = logging.getLogger(__name__)
 
-GARTH_HOME = os.environ.get("GARTH_HOME", os.path.expanduser("~/.garth"))
+# Default to ~/.garminconnect for consistency with the library's default token store
+GARMIN_HOME = os.environ.get("GARMIN_HOME", os.path.expanduser("~/.garminconnect"))
 
 
 class GarminClient:
     def __init__(self, email: str, password: str):
         self.email = email
         self.password = password
-        self._client: garth.Client | None = None
-        self._display_name: str | None = None
+        self._client: Garmin | None = None
 
     # ------------------------------------------------------------------
     # Session management
@@ -30,35 +30,18 @@ class GarminClient:
 
     def connect(self):
         """Authenticate (reuse cached session if available)."""
-        garth.configure(domain="garmin.com")
+        # Ensure directory exists before using it
+        os.makedirs(GARMIN_HOME, exist_ok=True)
 
-        # Only attempt resume if the directory exists AND contains tokens.
-        # This prevents FileNotFoundError if the user created an empty volume mount.
-        if os.path.isdir(GARTH_HOME) and os.path.isfile(os.path.join(GARTH_HOME, "oauth1_token.json")):
-            try:
-                garth.resume(GARTH_HOME)
-                garth.client.username  # trigger validation
-                log.info("Resumed existing Garmin session from %s", GARTH_HOME)
-                self._client = garth.client
-                self._display_name = self._fetch_display_name()
-                return
-            except Exception as e:
-                log.info("Cached session invalid or incomplete (%s), re-authenticating…", e)
+        self._client = Garmin(self.email, self.password)
 
-        log.info("Logging into Garmin Connect...")
-        garth.login(self.email, self.password)
-
-        # Ensure directory exists before saving
-        os.makedirs(GARTH_HOME, exist_ok=True)
-        garth.save(GARTH_HOME)
-        self._client = garth.client
-        self._display_name = self._fetch_display_name()
-        log.info("Garmin authentication successful. Session saved to %s", GARTH_HOME)
-
-    def _fetch_display_name(self) -> str:
-        """Fetch the UUID display name required by the wellness API."""
-        resp = self._client.connectapi("/userprofile-service/socialProfile")
-        return resp["displayName"]
+        try:
+            log.info("Attempting to resume Garmin session from %s", GARMIN_HOME)
+            self._client.login(GARMIN_HOME)
+            log.info("Garmin authentication successful (resumed or new login).")
+        except Exception as e:
+            log.error("Garmin authentication failed: %s", e)
+            raise
 
     def _ensure_connected(self):
         if self._client is None:
@@ -71,17 +54,11 @@ class GarminClient:
     def get_covered_minutes(self, date: str) -> set[datetime]:
         """
         Return the set of UTC minute-datetimes that already have HR data on
-        Garmin Connect for the given date (YYYY-MM-DD), regardless of whether
-        that data came from a real device or a previous fitbit2garmin upload.
-
-        Used to avoid uploading Fitbit data over a minute that is already
-        populated (by any source).  Falls back to an empty set on 403/error
-        so callers can continue safely without this check.
+        Garmin Connect for the given date (YYYY-MM-DD).
         """
         self._ensure_connected()
         try:
-            url = f"/wellness-service/wellness/dailyHeartRate/{self._display_name}?date={date}"
-            resp = self._client.connectapi(url)
+            resp = self._client.get_heart_rates(date)
             values = resp.get("heartRateValues") or []
             covered = set()
             for v in values:
@@ -103,11 +80,6 @@ class GarminClient:
     def filter_covered_points(self, points: list[dict]) -> list[dict]:
         """
         Remove any points whose minute already has HR data on Garmin Connect.
-
-        This prevents uploading Fitbit data over any minute that's already
-        populated — whether from a real device sync or a previous fitbit2garmin
-        upload.  When the wellness API is unavailable (403), all points pass
-        through so the StateStore watermark acts as the fallback guard.
         """
         if not points:
             return []
@@ -141,14 +113,19 @@ class GarminClient:
         """
         self._ensure_connected()
 
-        upload_url = "/upload-service/upload"
         _MAX_ATTEMPTS = 3
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            files = {"file": (filename, io.BytesIO(fit_bytes), "application/octet-stream")}
             log.info("Uploading %d-byte FIT file to Garmin (%s)…", len(fit_bytes), filename)
             try:
-                resp = self._client.connectapi(upload_url, method="POST", files=files)
+                # The upload_activity method in garminconnect expects a file path.
+                # However, our FIT files are generated in-memory.
+                # Since garminconnect doesn't seem to expose a direct binary upload
+                # for activities in its high-level API easily, we use the internal
+                # client's post method which is what upload_activity uses under the hood.
+                files = {"file": (filename, io.BytesIO(fit_bytes), "application/octet-stream")}
+                # Use the same endpoint as garth did
+                resp = self._client.client.post("connectapi", "/upload-service/upload", files=files, api=True)
                 log.info("Garmin upload response: %s", resp)
                 return resp
             except Exception as e:

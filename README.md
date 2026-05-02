@@ -128,8 +128,8 @@ mkdir -p /opt/fitbit2garmin/data
 cp config.yaml /opt/fitbit2garmin/data/config.yaml
 cp token.json  /opt/fitbit2garmin/data/token.json   # from the auth step above
 
-# Copy your existing Garmin session (from garth login, usually at ~/.garth)
-cp -r ~/.garth /opt/fitbit2garmin/data/garth
+# Copy your existing Garmin session (usually at ~/.garminconnect)
+cp -r ~/.garminconnect /opt/fitbit2garmin/data/garminconnect
 ```
 
 ### Run
@@ -140,7 +140,7 @@ docker run -d \
   --restart unless-stopped \
   -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
-  -e GARTH_HOME=/app/data/garth \
+  -e GARMIN_HOME=/app/data/garminconnect \
   fitbit2garmin
 ```
 
@@ -162,7 +162,7 @@ crontab -e
 0 */2 * * * docker run --rm \
   -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
-  -e GARTH_HOME=/app/data/garth \
+  -e GARMIN_HOME=/app/data/garminconnect \
   fitbit2garmin python debug_sync.py >> /var/log/fitbit2garmin.log 2>&1
 ```
 
@@ -171,7 +171,7 @@ crontab -e
 ## Token Refresh
 
 - **Fitbit**: tokens auto-refresh via `requests-oauthlib`. The updated token is saved back to `token.json` automatically.
-- **Garmin**: the `garth` session is cached in `GARTH_HOME` and refreshed on expiry.
+- **Garmin**: the session is cached in `GARMIN_HOME` and refreshed on expiry.
 
 If the Fitbit token ever expires completely, re-run the authorization step in Setup §4.
 
