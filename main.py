@@ -197,8 +197,8 @@ def main():
         client_secret=cfg["fitbit"]["client_secret"],
     )
     garmin = GarminClient(
-        email=cfg["garmin"]["email"],
-        password=cfg["garmin"]["password"],
+        email=os.environ.get("GARMIN_EMAIL", cfg["garmin"]["email"]),
+        password=os.environ.get("GARMIN_PASSWORD", cfg["garmin"]["password"]),
     )
     garmin.connect()
 
