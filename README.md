@@ -140,7 +140,7 @@ docker run -d \
   --restart unless-stopped \
   -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
-  -e GARMIN_HOME=/app/data/garminconnect \
+  -e STATE_DIRECTORY=/app/data/\
   fitbit2garmin
 ```
 
@@ -162,7 +162,7 @@ crontab -e
 0 */2 * * * docker run --rm \
   -v /opt/fitbit2garmin/data:/app/data \
   -e CONFIG_FILE=/app/data/config.yaml \
-  -e GARMIN_HOME=/app/data/garminconnect \
+  -e STATE_DIRECTORY=/app/data/ \
   fitbit2garmin python debug_sync.py >> /var/log/fitbit2garmin.log 2>&1
 ```
 
@@ -171,7 +171,7 @@ crontab -e
 ## Token Refresh
 
 - **Fitbit**: tokens auto-refresh via `requests-oauthlib`. The updated token is saved back to `token.json` automatically.
-- **Garmin**: the session is cached in `GARMIN_HOME` and refreshed on expiry.
+- **Garmin**: the session is cached in `STATE_DIRECTORY` and refreshed on expiry.
 
 If the Fitbit token ever expires completely, re-run the authorization step in Setup §4.
 

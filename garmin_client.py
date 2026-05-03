@@ -15,7 +15,7 @@ from garminconnect import Garmin
 log = logging.getLogger(__name__)
 
 # Default to ~/.garminconnect for consistency with the library's default token store
-GARMIN_HOME = os.environ.get("GARMIN_HOME", os.path.expanduser("~/.garminconnect"))
+GARMIN_HOME = os.environ.get("STATE_DIRECTORY", os.path.expanduser("~/.garminconnect"))
 
 
 class GarminClient:

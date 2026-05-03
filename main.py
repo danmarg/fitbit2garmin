@@ -25,7 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("fitbit2garmin")
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join("data", "config.yaml"))
-STATE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), "state.json")
+STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY"), "state.json")
 
 
 class StateStore:
