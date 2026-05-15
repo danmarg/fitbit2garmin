@@ -162,7 +162,7 @@ def _monitoring_messages(points: list[dict]) -> bytes:
     """
     defn_activity = _definition_record(3, MESG_NUM_MONITORING, [
         (253, 4, UINT32),  # timestamp
-        (3,   4, UINT32),  # cycles (cumulative steps * 2, within segment)
+        (3,   4, UINT32),  # cycles (cumulative steps, within segment)
         (5,   1, UINT8),   # activity_type (6=walking makes cycles represent steps)
     ])
     defn_hr = _definition_record(4, MESG_NUM_MONITORING, [
@@ -179,7 +179,7 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         hr = max(0, min(255, pt.get("heart_rate", 0)))
         # Segment-relative cumulative: steps accumulated within this segment only
         steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
-        cycles = max(0, steps_cum_in_segment * 2)
+        cycles = max(0, steps_cum_in_segment)
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
