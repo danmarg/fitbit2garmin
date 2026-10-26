@@ -282,5 +282,31 @@ class TestFilterCoveredPoints(unittest.TestCase):
             self.assertEqual(called_dates, {"2026-03-11", "2026-03-12"})
 
 
+class TestUploadDuplicate(unittest.TestCase):
+    """A 409 'Duplicate Wellness File' means Garmin already has the data."""
+
+    def setUp(self):
+        from garmin_client import GarminClient
+        self.client = GarminClient.__new__(GarminClient)
+        self.client._client = MagicMock()
+
+    def test_409_is_not_retried_and_reports_duplicate(self):
+        post = self.client._client.client.post
+        post.side_effect = Exception("API Error 409 - {'code': 409, 'content': 'Duplicate Wellness File.'}")
+        with patch("time.sleep") as sleep:
+            result = self.client.upload_fit(b"fit")
+        self.assertEqual(result, {"status": "duplicate"})
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_other_errors_still_retry_then_raise(self):
+        post = self.client._client.client.post
+        post.side_effect = Exception("API Error 500")
+        with patch("time.sleep"):
+            with self.assertRaises(Exception):
+                self.client.upload_fit(b"fit")
+        self.assertEqual(post.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # Add current dir to sys.path just in case
 sys.path.append(os.getcwd())
 
-from fitbit_client import FitbitClient
+from google_health_client import GoogleHealthClient
 from garmin_client import GarminClient
 from main import run_sync, StateStore
 
@@ -28,9 +28,10 @@ def main():
 
     log.info("Starting single debug sync cycle...")
     
-    fitbit = FitbitClient(
-        client_id=cfg["fitbit"]["client_id"],
-        client_secret=cfg["fitbit"]["client_secret"],
+    health = GoogleHealthClient(
+        client_id=cfg["google_health"]["client_id"],
+        client_secret=cfg["google_health"]["client_secret"],
+        default_timezone=cfg["google_health"].get("timezone", "UTC"),
     )
     
     garmin = GarminClient(
@@ -46,7 +47,7 @@ def main():
         # Increase lookback for debug
         cfg["sync"]["lookback_hours"] = 48
         state = StateStore(os.path.join("data", "state.json"))
-        run_sync(cfg, fitbit, garmin, state)
+        run_sync(cfg, health, garmin, state)
         log.info("Debug sync cycle finished.")
     except Exception as e:
         log.exception("Debug sync failed: %s", e)

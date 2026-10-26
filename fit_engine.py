@@ -1,6 +1,6 @@
 """
 fit_engine.py
-Encodes Garmin Monitoring FIT files (file type 9) from Fitbit intraday data.
+Encodes Garmin Monitoring FIT files (file type 9) from Google Health (Fitbit) intraday data.
 Uses the Garmin FIT SDK (Python) to produce correctly-checksummed binary files.
 """
 
@@ -204,7 +204,7 @@ def build_monitoring_fit(
     Build a complete, valid Garmin Monitoring FIT file (type 9).
 
     Args:
-        points: merged intraday list from FitbitClient.get_combined_intraday()
+        points: merged intraday list from GoogleHealthClient.get_combined_intraday()
         manufacturer: Garmin manufacturer ID (usually 1)
         product_id: Garmin product ID from identity_grabber
         serial_number: Device serial number from identity_grabber

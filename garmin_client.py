@@ -65,7 +65,7 @@ class GarminClient:
                 if v[1] is not None:  # skip null/gap entries
                     # heartRateValues timestamps are in ms since Unix epoch
                     dt = datetime.fromtimestamp(v[0] / 1000.0, tz=timezone.utc)
-                    # Truncate to the minute so we match FitbitClient's 1-min resolution
+                    # Truncate to the minute so we match the source data's 1-min resolution
                     covered.add(dt.replace(second=0, microsecond=0))
             log.info("Garmin already has %d covered minute(s) for %s", len(covered), date)
             return covered
@@ -129,6 +129,10 @@ class GarminClient:
                 log.info("Garmin upload response: %s", resp)
                 return resp
             except Exception as e:
+                if "409" in str(e) or "Duplicate Wellness File" in str(e):
+                    # Garmin already has this file; retrying can never succeed.
+                    log.warning("Garmin reports a duplicate wellness file — treating as already uploaded: %s", e)
+                    return {"status": "duplicate"}
                 if attempt < _MAX_ATTEMPTS:
                     delay = 5 * attempt  # 5 s, 10 s
                     log.warning(

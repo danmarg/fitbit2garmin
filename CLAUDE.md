@@ -35,13 +35,13 @@ docker compose logs -f
 
 ## Architecture
 
-This service syncs Fitbit intraday heart rate and step data to Garmin Connect by encoding valid binary Garmin Monitoring (type 9) FIT files and uploading them via the device sync endpoint — making them appear as if from a real Garmin device.
+This service syncs Fitbit intraday heart rate and step data (read via the Google Health API) to Garmin Connect by encoding valid binary Garmin Monitoring (type 9) FIT files and uploading them via the device sync endpoint — making them appear as if from a real Garmin device.
 
 ### Data flow
 
 ```
-Fitbit API (1-min HR + steps)
-  → UTC-normalised points (fitbit_client.py)
+Google Health API (:rollUp, 60s windows, reconciled)
+  → 1-min UTC points (google_health_client.py)
   → Recency buffer (hold back last N minutes for real device to sync first)
   → StateStore watermark filter (skip already-uploaded)
   → Garmin coverage check (skip minutes already on Garmin, 403 → pass-through)
@@ -57,7 +57,7 @@ Fitbit API (1-min HR + steps)
 |------|------|
 | `main.py` | Single sync cycle orchestration: `StateStore`, `split_segments`, `run_sync`. Runs once and exits (looping controlled by cron/systemd) |
 | `fit_engine.py` | Binary FIT encoder — builds header, definition/data records, CRC checksums |
-| `fitbit_client.py` | OAuth2 auth, intraday fetch, wall-clock → UTC conversion |
+| `google_health_client.py` | Google OAuth2, rollUp fetch (60s windows), account timezone, cumulative steps |
 | `garmin_client.py` | garth session mgmt, wellness coverage check, FIT upload |
 | `identity_grabber.py` | Extracts manufacturer/product/serial/software_version from a real FIT file |
 | `debug_sync.py` | Single-shot runner for manual testing |
@@ -66,7 +66,7 @@ Fitbit API (1-min HR + steps)
 ### Configuration
 
 Copy `config.yaml.example` → `config.yaml` (git-ignored). Key settings under `sync:`:
-- `lookback_hours` — how far back to fetch from Fitbit (default 4)
+- `lookback_hours` — how far back to fetch from Google Health (default 4)
 - `recency_minutes` — hold-back buffer so a real Garmin device can sync first (default 60)
 - `hooks.on_success` / `hooks.on_failure` — optional shell commands (e.g. healthchecks.io)
 
@@ -100,7 +100,7 @@ To customize the Docker schedule, edit `crontab` before building the image, or o
 
 ### Token / auth files
 
-- Fitbit OAuth2 token: `data/token.json`
+- Google Health OAuth2 token: `data/google_health_token.json`
 - Garmin garth session: `data/garth/oauth1_token.json` + `oauth2_token.json`
-- First-time Fitbit auth requires running interactively (`fitbit.authorize()`)
+- First-time auth requires running interactively (`GoogleHealthClient.authorize()`)
 - Garmin re-authenticates automatically if cached session is invalid
