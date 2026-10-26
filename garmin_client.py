@@ -129,6 +129,10 @@ class GarminClient:
                 log.info("Garmin upload response: %s", resp)
                 return resp
             except Exception as e:
+                if "409" in str(e) or "Duplicate Wellness File" in str(e):
+                    # Garmin already has this file; retrying can never succeed.
+                    log.warning("Garmin reports a duplicate wellness file — treating as already uploaded: %s", e)
+                    return {"status": "duplicate"}
                 if attempt < _MAX_ATTEMPTS:
                     delay = 5 * attempt  # 5 s, 10 s
                     log.warning(
