@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -27,12 +26,14 @@ TOKEN_FILE = os.environ.get(
 )
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
-API_BASE = "https://health.googleapis.com/v4/users/me/dataTypes"
+API_BASE = "https://health.googleapis.com/v4/users/me/dataTypes"  # {type}/dataPoints:rollUp
 REDIRECT_URI = "http://localhost:8080/"
 SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
+    "https://www.googleapis.com/auth/googlehealth.settings.readonly",
 ]
+SETTINGS_URL = "https://health.googleapis.com/v4/users/me/settings"
 PAGE_SIZE = 10000
 
 
@@ -42,16 +43,6 @@ def _parse_time(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
-
-def _parse_offset(value) -> int | None:
-    """Parse a UTC offset such as '3600s' (or a bare number) into whole seconds."""
-    if value is None:
-        return None
-    try:
-        return int(float(str(value).rstrip("s")))
-    except ValueError:
-        return None
 
 
 def _floor_minute(dt: datetime) -> datetime:
@@ -171,102 +162,73 @@ class GoogleHealthClient:
     # Data fetching
     # ------------------------------------------------------------------
 
-    def _list_data_points(self, data_type: str, time_field: str, start: datetime) -> list[dict]:
-        """
-        Page through users/me/dataTypes/{data_type}/dataPoints for points at or
-        after `start`. `time_field` is the snake_case filter path for the point's
-        start time (e.g. "steps.interval.start_time").
-        """
+    def _auth_headers(self) -> dict:
         token = self._load_token()
-        headers = {"Authorization": f"Bearer {token['access_token']}"}
-        params = {
-            "filter": f'{time_field} >= "{start.strftime("%Y-%m-%dT%H:%M:%SZ")}"',
+        return {"Authorization": f"Bearer {token['access_token']}"}
+
+    def get_user_timezone(self) -> str:
+        """Fetch the user's IANA timezone (e.g., 'America/New_York') from their account settings."""
+        resp = self.http.get(SETTINGS_URL, headers=self._auth_headers())
+        resp.raise_for_status()
+        return resp.json().get("timeZone") or self.default_timezone
+
+    def _roll_up_minutes(self, data_type: str, start: datetime, end: datetime) -> list[dict]:
+        """
+        POST users/me/dataTypes/{data_type}/dataPoints:rollUp with 60s windows over
+        [start, end). The API reconciles overlapping sources and drops off-wrist
+        periods; each result is {"startTime", "endTime", <dataType camelCase>: {...}}.
+        """
+        body = {
+            "range": {
+                "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "endTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "windowSize": "60s",
             "pageSize": PAGE_SIZE,
         }
         points: list[dict] = []
         while True:
-            resp = self.http.get(f"{API_BASE}/{data_type}/dataPoints", headers=headers, params=params)
+            resp = self.http.post(
+                f"{API_BASE}/{data_type}/dataPoints:rollUp", headers=self._auth_headers(), json=body
+            )
             if not resp.ok:
-                log.error("Google Health %s list failed: %d %s", data_type, resp.status_code, resp.text)
+                log.error("Google Health %s rollUp failed: %d %s", data_type, resp.status_code, resp.text)
                 resp.raise_for_status()
-            body = resp.json()
-            points.extend(body.get("dataPoints", []))
-            next_token = body.get("nextPageToken")
+            data = resp.json()
+            points.extend(data.get("rollupDataPoints", []))
+            next_token = data.get("nextPageToken")
             if not next_token:
                 break
-            params["pageToken"] = next_token
-        log.info("Google Health %s: %d data point(s) since %s", data_type, len(points), start.isoformat())
+            body["pageToken"] = next_token
+        log.info("Google Health %s: %d minute window(s) since %s", data_type, len(points), start.isoformat())
         return points
 
     @staticmethod
-    def parse_heart_rate(data_points: list[dict]) -> tuple[dict[datetime, int], dict[datetime, int]]:
-        """
-        Collapse point-in-time HR samples into one value per UTC minute (mean bpm).
-
-        Returns (bpm_by_minute, utc_offset_by_minute).
-        """
-        samples: dict[datetime, list[int]] = defaultdict(list)
-        offsets: dict[datetime, int] = {}
-        for dp in data_points:
-            hr = dp.get("heartRate") or {}
-            sample_time = hr.get("sampleTime") or {}
-            raw_time = sample_time.get("physicalTime")
-            bpm = hr.get("beatsPerMinute")
-            if raw_time is None or bpm is None:
+    def parse_heart_rate(rollups: list[dict]) -> dict[datetime, int]:
+        """Map each 60s heart-rate rollup to {UTC minute: mean bpm}."""
+        out: dict[datetime, int] = {}
+        for r in rollups:
+            avg = (r.get("heartRate") or {}).get("beatsPerMinuteAvg")
+            if r.get("startTime") is None or avg is None:
                 continue
-            minute = _floor_minute(_parse_time(raw_time))
-            samples[minute].append(int(bpm))
-            offset = _parse_offset(sample_time.get("utcOffset"))
-            if offset is not None:
-                offsets[minute] = offset
-        return {m: round(sum(v) / len(v)) for m, v in samples.items()}, offsets
+            out[_floor_minute(_parse_time(r["startTime"]))] = round(float(avg))
+        return out
 
     @staticmethod
-    def parse_steps(data_points: list[dict]) -> tuple[dict[datetime, int], dict[datetime, int]]:
-        """
-        Spread step intervals across the UTC minutes they cover.
-
-        Returns (steps_by_minute, utc_offset_by_minute).
-        """
-        steps: dict[datetime, int] = defaultdict(int)
-        offsets: dict[datetime, int] = {}
-        for dp in data_points:
-            interval = (dp.get("steps") or {}).get("interval") or {}
-            raw_start = interval.get("startTime")
-            raw_end = interval.get("endTime")
-            count = (dp.get("steps") or {}).get("count")
-            if raw_start is None or count is None:
+    def parse_steps(rollups: list[dict]) -> dict[datetime, int]:
+        """Map each 60s steps rollup to {UTC minute: steps}. countSum is an int64 string."""
+        out: dict[datetime, int] = {}
+        for r in rollups:
+            count = (r.get("steps") or {}).get("countSum")
+            if r.get("startTime") is None or count is None:
                 continue
-            start = _parse_time(raw_start)
-            end = _parse_time(raw_end) if raw_end else start
-            first = _floor_minute(start)
-            # Minutes touched by [start, end); a zero-length interval counts as one minute.
-            n_minutes = max(1, int((_floor_minute(end - timedelta(microseconds=1)) - first).total_seconds() // 60) + 1) \
-                if end > start else 1
-            total = int(count)
-            base, remainder = divmod(total, n_minutes)
-            offset = _parse_offset(interval.get("startUtcOffset"))
-            for i in range(n_minutes):
-                minute = first + timedelta(minutes=i)
-                steps[minute] += base + (1 if i < remainder else 0)
-                if offset is not None:
-                    offsets[minute] = offset
-        return dict(steps), offsets
-
-    def _fallback_offset_seconds(self, at: datetime) -> int:
-        import pytz
-
-        try:
-            tz = pytz.timezone(self.default_timezone)
-        except pytz.UnknownTimeZoneError:
-            log.warning("Unknown timezone %r — using UTC.", self.default_timezone)
-            tz = pytz.utc
-        offset = at.astimezone(tz).utcoffset()
-        return int(offset.total_seconds()) if offset is not None else 0
+            out[_floor_minute(_parse_time(r["startTime"]))] = int(count)
+        return out
 
     def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:
         """
-        Fetch HR + Steps for the last `lookback_hours` hours, merged by minute, in UTC.
+        Fetch HR + Steps for the last `lookback_hours` hours, merged by minute,
+        in UTC, with day boundaries taken from the user's Google Health timezone.
 
         Returns a tuple of:
           - list of dicts:
@@ -274,36 +236,38 @@ class GoogleHealthClient:
               sorted ascending by time.
           - utc_offset_seconds: the user's current UTC offset in whole seconds (e.g. 3600 for UTC+1)
         """
+        import pytz
+
+        try:
+            tz_name = self.get_user_timezone()
+            log.info("Google Health user timezone: %s", tz_name)
+            local_tz = pytz.timezone(tz_name)
+        except Exception as e:
+            log.warning("Could not fetch timezone, using %r: %s", self.default_timezone, e)
+            try:
+                local_tz = pytz.timezone(self.default_timezone)
+            except Exception:
+                local_tz = pytz.utc
+
         now_utc = datetime.now(timezone.utc)
-        cutoff_utc = now_utc - timedelta(hours=lookback_hours)
+        cutoff_utc = _floor_minute(now_utc - timedelta(hours=lookback_hours))
+        end_utc = _floor_minute(now_utc) + timedelta(minutes=1)
 
         # cumulative_steps is steps-since-local-midnight, so steps must be fetched from the
-        # start of the cutoff's local day. That is at most 24h before the cutoff.
-        steps_start = cutoff_utc - timedelta(hours=24)
+        # start of the cutoff's local day.
+        cutoff_local = cutoff_utc.astimezone(local_tz)
+        start_of_day_local = cutoff_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day_local.astimezone(timezone.utc)
 
-        hr_by_minute, hr_offsets = self.parse_heart_rate(
-            self._list_data_points("heart-rate", "heart_rate.sample_time.physical_time", cutoff_utc)
-        )
-        steps_by_minute, steps_offsets = self.parse_steps(
-            self._list_data_points("steps", "steps.interval.start_time", steps_start)
-        )
+        hr_by_minute = self.parse_heart_rate(self._roll_up_minutes("heart-rate", cutoff_utc, end_utc))
+        steps_by_minute = self.parse_steps(self._roll_up_minutes("steps", start_of_day_utc, end_utc))
 
-        offsets = {**steps_offsets, **hr_offsets}
-        if offsets:
-            utc_offset_seconds = offsets[max(offsets)]  # most recent observed offset
-        else:
-            utc_offset_seconds = self._fallback_offset_seconds(now_utc)
-
-        def offset_at(dt: datetime) -> int:
-            return offsets.get(dt, utc_offset_seconds)
-
-        all_times = sorted(set(hr_by_minute) | set(steps_by_minute))
         merged = []
         cumulative_steps = 0
         current_local_date = None
 
-        for dt in all_times:
-            local_date = (dt + timedelta(seconds=offset_at(dt))).date()
+        for dt in sorted(set(hr_by_minute) | set(steps_by_minute)):
+            local_date = dt.astimezone(local_tz).date()
             if local_date != current_local_date:
                 current_local_date = local_date
                 cumulative_steps = 0  # Reset at local midnight
@@ -324,5 +288,8 @@ class GoogleHealthClient:
             )
 
         log.info("Got %d merged intraday points for last %dh", len(merged), lookback_hours)
+        # Current UTC offset for the user's timezone (handles DST automatically)
+        utc_offset = now_utc.astimezone(local_tz).utcoffset()
+        utc_offset_seconds = int(utc_offset.total_seconds()) if utc_offset is not None else 0
         log.info("UTC offset for FIT local_timestamp: %+ds (%+.1fh)", utc_offset_seconds, utc_offset_seconds / 3600)
         return merged, utc_offset_seconds

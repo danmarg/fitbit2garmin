@@ -4,7 +4,7 @@
 google_health:
   client_id: "YOUR_GOOGLE_OAUTH_CLIENT_ID"
   client_secret: "YOUR_GOOGLE_OAUTH_CLIENT_SECRET"
-  # Only used if the API returns no UTC offset (IANA name, e.g. America/New_York)
+  # Fallback IANA timezone (e.g. America/New_York), used only if the account timezone cannot be read
   timezone: "UTC"
   # google_health_token.json will be created after first auth run
 

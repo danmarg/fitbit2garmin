@@ -22,12 +22,12 @@ Pulls Fitbit intraday heart rate (via the Google Health API) and step data and i
 
 ### 1. Google Health API OAuth client
 
-The legacy Fitbit Web API shuts down on 2026-10-30; this project uses the [Google Health API](https://developers.google.com/health).
+The legacy Fitbit Web API shuts down on 2026-11-02; this project uses the [Google Health API](https://developers.google.com/health).
 
 1. In [Google Cloud Console](https://console.cloud.google.com), create a project and enable the **Google Health API**
 2. Configure the OAuth consent screen and add yourself as a **test user** (note: Google expires refresh tokens after 7 days for apps left in *Testing* mode — publish the app to "In production" for personal use to avoid re-authorizing weekly)
 3. Create an **OAuth client ID** with a redirect URI of `http://localhost:8080/`
-4. Request the read scopes `googlehealth.activity_and_fitness.readonly` and `googlehealth.health_metrics_and_measurements.readonly`
+4. The app requests these read scopes: `googlehealth.activity_and_fitness.readonly` (steps), `googlehealth.health_metrics_and_measurements.readonly` (heart rate) and `googlehealth.settings.readonly` (timezone)
 5. Note your **Client ID** and **Client Secret**
 
 Existing Fitbit tokens do not carry over; you must authorize again (§4).

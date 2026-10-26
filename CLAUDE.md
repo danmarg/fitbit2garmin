@@ -40,7 +40,7 @@ This service syncs Fitbit intraday heart rate and step data (read via the Google
 ### Data flow
 
 ```
-Google Health API (HR samples + step intervals)
+Google Health API (:rollUp, 60s windows, reconciled)
   → 1-min UTC points (google_health_client.py)
   → Recency buffer (hold back last N minutes for real device to sync first)
   → StateStore watermark filter (skip already-uploaded)
@@ -57,7 +57,7 @@ Google Health API (HR samples + step intervals)
 |------|------|
 | `main.py` | Single sync cycle orchestration: `StateStore`, `split_segments`, `run_sync`. Runs once and exits (looping controlled by cron/systemd) |
 | `fit_engine.py` | Binary FIT encoder — builds header, definition/data records, CRC checksums |
-| `google_health_client.py` | Google OAuth2, dataPoints fetch, per-minute aggregation, UTC offsets |
+| `google_health_client.py` | Google OAuth2, rollUp fetch (60s windows), account timezone, cumulative steps |
 | `garmin_client.py` | garth session mgmt, wellness coverage check, FIT upload |
 | `identity_grabber.py` | Extracts manufacturer/product/serial/software_version from a real FIT file |
 | `debug_sync.py` | Single-shot runner for manual testing |
