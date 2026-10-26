@@ -1,5 +1,5 @@
 # Fitbit2Garmin crontab (for Docker container)
-# Runs the Fitbit-to-Garmin sync every hour
+# Runs the Google Health-to-Garmin sync every hour
 #
 # For system cron (outside Docker), use install_cron.sh instead:
 #   ./install_cron.sh [--frequency "0 * * * *"]

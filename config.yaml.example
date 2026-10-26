@@ -1,10 +1,12 @@
 # Fitbit2Garmin Configuration
 # Copy this to config.yaml and fill in your values.
 
-fitbit:
-  client_id: "YOUR_FITBIT_CLIENT_ID"
-  client_secret: "YOUR_FITBIT_CLIENT_SECRET"
-  # token.json will be created after first auth run
+google_health:
+  client_id: "YOUR_GOOGLE_OAUTH_CLIENT_ID"
+  client_secret: "YOUR_GOOGLE_OAUTH_CLIENT_SECRET"
+  # Only used if the API returns no UTC offset (IANA name, e.g. America/New_York)
+  timezone: "UTC"
+  # google_health_token.json will be created after first auth run
 
 garmin:
   email: "your@email.com"
@@ -20,7 +22,7 @@ device:
   software_version: 331   # raw value: actual_version * 100 (e.g. 331 = firmware 3.31)
 
 sync:
-  lookback_hours: 4     # How many hours back to pull from Fitbit
+  lookback_hours: 4     # How many hours back to pull from Google Health
   recency_minutes: 60   # Don't upload data newer than this many minutes;
                         # gives the real Garmin device time to sync first
   hooks:

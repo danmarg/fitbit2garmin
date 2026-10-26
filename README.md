@@ -1,10 +1,10 @@
 # Fitbit2Garmin
 
-Pulls Fitbit intraday heart rate and step data and injects it into Garmin Connect as `monitoring_b` FIT files, impersonating your registered Garmin device. This populates 24/7 HR data in Garmin Connect, which feeds Training Load, Suggested Workouts, and Physio TrueUp calculations.
+Pulls Fitbit intraday heart rate (via the Google Health API) and step data and injects it into Garmin Connect as `monitoring_b` FIT files, impersonating your registered Garmin device. This populates 24/7 HR data in Garmin Connect, which feeds Training Load, Suggested Workouts, and Physio TrueUp calculations.
 
 ## How It Works
 
-1. Fetches intraday HR + steps from the Fitbit API (1-minute resolution)
+1. Fetches intraday HR + steps from the Google Health API (aggregated to 1-minute resolution)
 2. Encodes a valid Garmin `monitoring_b` FIT file using the exact binary format produced by your device's firmware
 3. Uploads to Garmin Connect via the device sync endpoint, skipping time windows already covered by real device data
 
@@ -12,7 +12,7 @@ Pulls Fitbit intraday heart rate and step data and injects it into Garmin Connec
 
 ## Prerequisites
 
-- A Fitbit account with a synced device
+- A Fitbit device linked to a Google account (Fitbit accounts are migrating to Google accounts)
 - A Garmin Connect account with an active wearable (used to clone the device identity)
 - Docker (for deployment) or Python 3.11+
 
@@ -20,14 +20,17 @@ Pulls Fitbit intraday heart rate and step data and injects it into Garmin Connec
 
 ## Setup
 
-### 1. Fitbit App (Personal access required)
+### 1. Google Health API OAuth client
 
-Intraday data requires a **Personal** app type.
+The legacy Fitbit Web API shuts down on 2026-10-30; this project uses the [Google Health API](https://developers.google.com/health).
 
-1. Go to [dev.fitbit.com](https://dev.fitbit.com) → Manage → Register an App
-2. Set **OAuth 2.0 Application Type** to **Personal**
-3. Set **Redirect URL** to `http://localhost:8080/`
-4. Note your **Client ID** and **Client Secret**
+1. In [Google Cloud Console](https://console.cloud.google.com), create a project and enable the **Google Health API**
+2. Configure the OAuth consent screen and add yourself as a **test user** (note: Google expires refresh tokens after 7 days for apps left in *Testing* mode — publish the app to "In production" for personal use to avoid re-authorizing weekly)
+3. Create an **OAuth client ID** with a redirect URI of `http://localhost:8080/`
+4. Request the read scopes `googlehealth.activity_and_fitness.readonly` and `googlehealth.health_metrics_and_measurements.readonly`
+5. Note your **Client ID** and **Client Secret**
+
+Existing Fitbit tokens do not carry over; you must authorize again (§4).
 
 ### 2. Extract Your Garmin Device Identity
 
@@ -54,7 +57,7 @@ cp config.yaml.example config.yaml
 Edit `config.yaml`:
 
 ```yaml
-fitbit:
+google_health:
   client_id: "YOUR_CLIENT_ID"
   client_secret: "YOUR_CLIENT_SECRET"
 
@@ -73,20 +76,20 @@ sync:
   interval_minutes: 120
 ```
 
-### 4. Authorize Fitbit
+### 4. Authorize Google Health
 
-Run the authorization flow once to generate `token.json`:
+Run the authorization flow once to generate `google_health_token.json`:
 
 ```bash
 python -c "
 import yaml
-from fitbit_client import FitbitClient
+from google_health_client import GoogleHealthClient
 cfg = yaml.safe_load(open('config.yaml'))
-FitbitClient(cfg['fitbit']['client_id'], cfg['fitbit']['client_secret']).authorize()
+GoogleHealthClient(cfg['google_health']['client_id'], cfg['google_health']['client_secret']).authorize()
 "
 ```
 
-Open the printed URL in your browser, approve access, then paste the redirect URL back. A `token.json` will be saved.
+Open the printed URL in your browser, approve access, then paste the redirect URL back.
 
 ---
 
@@ -126,7 +129,7 @@ docker build -t fitbit2garmin .
 ```bash
 mkdir -p /opt/fitbit2garmin/data
 cp config.yaml /opt/fitbit2garmin/data/config.yaml
-cp token.json  /opt/fitbit2garmin/data/token.json   # from the auth step above
+cp google_health_token.json /opt/fitbit2garmin/data/google_health_token.json   # from the auth step above
 
 # Copy your existing Garmin session (usually at ~/.garminconnect)
 cp -r ~/.garminconnect /opt/fitbit2garmin/data/garminconnect
@@ -170,10 +173,10 @@ crontab -e
 
 ## Token Refresh
 
-- **Fitbit**: tokens auto-refresh via `requests-oauthlib`. The updated token is saved back to `token.json` automatically.
+- **Google Health**: the access token auto-refreshes using the stored refresh token and is saved back to `google_health_token.json`.
 - **Garmin**: the session is cached in `STATE_DIRECTORY` and refreshed on expiry.
 
-If the Fitbit token ever expires completely, re-run the authorization step in Setup §4.
+If the Google Health token ever expires completely, re-run the authorization step in Setup §4.
 
 ---
 
@@ -183,7 +186,7 @@ If the Fitbit token ever expires completely, re-run the authorization step in Se
 |------|---------|
 | `main.py` | Orchestration loop |
 | `fit_engine.py` | Encodes binary `monitoring_b` FIT files |
-| `fitbit_client.py` | Fetches intraday HR + steps from Fitbit API |
+| `google_health_client.py` | Fetches HR + steps from the Google Health API |
 | `garmin_client.py` | Uploads FIT files to Garmin Connect |
 | `identity_grabber.py` | Extracts device identity from a `.fit` file |
 | `debug_sync.py` | Single-shot sync for testing |

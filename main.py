@@ -1,7 +1,7 @@
 """
 main.py
 Fitbit2Garmin orchestration loop.
-Pulls Fitbit intraday data, encodes a Garmin Monitoring FIT file, and uploads it.
+Pulls Google Health intraday data, encodes a Garmin Monitoring FIT file, and uploads it.
 """
 
 import json
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import yaml
 
-from fitbit_client import FitbitClient
+from google_health_client import GoogleHealthClient
 from fit_engine import build_monitoring_fit
 from garmin_client import GarminClient
 
@@ -83,7 +83,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     """
     Split a list of per-minute points into contiguous segments.
     A new segment begins whenever two consecutive points are more than
-    `gap_minutes` apart (e.g. Fitbit was off-wrist or data was missing).
+    `gap_minutes` apart (e.g. the tracker was off-wrist or data was missing).
     """
     if not points:
         return []
@@ -99,7 +99,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     return segments
 
 
-def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: StateStore):
+def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state: StateStore):
     """Execute one full sync cycle."""
     log.info("=== Fitbit2Garmin cycle starting ===")
 
@@ -107,12 +107,12 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
     recency_minutes = cfg["sync"].get("recency_minutes", 60)
     device = cfg["device"]
 
-    # 1. Pull Fitbit data
-    fitbit.ensure_authorized()
-    points, utc_offset_seconds = fitbit.get_combined_intraday(lookback_hours=lookback)
+    # 1. Pull Google Health data
+    health.ensure_authorized()
+    points, utc_offset_seconds = health.get_combined_intraday(lookback_hours=lookback)
 
     if not points:
-        log.warning("No Fitbit data returned for the last %dh — skipping.", lookback)
+        log.warning("No Google Health data returned for the last %dh — skipping.", lookback)
         return
 
     # 2. Apply recency buffer: hold back data newer than recency_minutes.
@@ -126,7 +126,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         log.info("Holding back %d point(s) newer than %d min ago.", held_back, recency_minutes)
 
     if not points:
-        log.info("All Fitbit data is within the recency buffer — nothing to upload yet.")
+        log.info("All Google Health data is within the recency buffer — nothing to upload yet.")
         return
 
     # 3. Drop points we already uploaded (StateStore watermark).
@@ -142,7 +142,7 @@ def run_sync(cfg: dict, fitbit: FitbitClient, garmin: GarminClient, state: State
         )
 
     if not points:
-        log.info("No new Fitbit data since last upload — nothing to do.")
+        log.info("No new Google Health data since last upload — nothing to do.")
         return
 
     # 4. Skip any minute already populated on Garmin (from any source —
@@ -192,9 +192,10 @@ def main():
     cfg = load_config(CONFIG_FILE)
     state = StateStore(STATE_FILE)
 
-    fitbit = FitbitClient(
-        client_id=cfg["fitbit"]["client_id"],
-        client_secret=cfg["fitbit"]["client_secret"],
+    health = GoogleHealthClient(
+        client_id=cfg["google_health"]["client_id"],
+        client_secret=cfg["google_health"]["client_secret"],
+        default_timezone=cfg["google_health"].get("timezone", "UTC"),
     )
     garmin = GarminClient(
         email=os.environ.get("GARMIN_EMAIL", cfg["garmin"]["email"]),
@@ -207,7 +208,7 @@ def main():
     hooks = cfg.get("sync", {}).get("hooks", {})
 
     try:
-        run_sync(cfg, fitbit, garmin, state)
+        run_sync(cfg, health, garmin, state)
         run_hook(hooks.get("on_success"))
     except Exception as e:
         log.exception("Sync cycle failed: %s", e)

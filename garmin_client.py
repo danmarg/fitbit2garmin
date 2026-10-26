@@ -65,7 +65,7 @@ class GarminClient:
                 if v[1] is not None:  # skip null/gap entries
                     # heartRateValues timestamps are in ms since Unix epoch
                     dt = datetime.fromtimestamp(v[0] / 1000.0, tz=timezone.utc)
-                    # Truncate to the minute so we match FitbitClient's 1-min resolution
+                    # Truncate to the minute so we match the source data's 1-min resolution
                     covered.add(dt.replace(second=0, microsecond=0))
             log.info("Garmin already has %d covered minute(s) for %s", len(covered), date)
             return covered
