@@ -1,3 +1,4 @@
+import os
 import unittest
 import pytz  # import the real module before test_pipeline_logic stubs it
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,34 @@ class TestCombined(unittest.TestCase):
         self.assertEqual(calls[0][1]["windowSize"], "60s")
         self.assertEqual(calls[0][1]["range"]["startTime"], "2026-03-11T10:00:00Z")
         self.assertEqual(calls[1][1]["pageToken"], "t")
+
+
+class TestAuthGuards(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        import google_health_client as g
+        self.g = g
+        self.tmp = tempfile.mkdtemp()
+        self.patcher = patch.object(g, "TOKEN_FILE", os.path.join(self.tmp, "google_health_token.json"))
+        self.patcher.start()
+        self.client = GoogleHealthClient("id", "secret")
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    def test_token_file_is_owner_only(self):
+        self.client._save_token({"access_token": "a", "refresh_token": "r"})
+        self.assertEqual(os.stat(self.g.TOKEN_FILE).st_mode & 0o777, 0o600)
+
+    def test_missing_token_without_tty_fails_fast(self):
+        with patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "no terminal"):
+                self.client.ensure_authorized()
+
+    def test_expired_token_without_refresh_token_raises(self):
+        self.client._save_token({"access_token": "a", "expires_at": 0})
+        with self.assertRaisesRegex(RuntimeError, "No refresh token"):
+            self.client.ensure_authorized()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Token state is persisted to google_health_token.json and refreshed automatically
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -71,8 +72,11 @@ class GoogleHealthClient:
         existing = self._load_token() or {}
         existing.update(token)
         os.makedirs(os.path.dirname(TOKEN_FILE) or ".", exist_ok=True)
-        with open(TOKEN_FILE, "w") as f:
+        # The token file holds a long-lived refresh_token; keep it owner-only.
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             json.dump(existing, f, indent=2)
+        os.chmod(TOKEN_FILE, 0o600)
         log.debug("Token saved to %s", TOKEN_FILE)
 
     def authorize(self):
@@ -113,8 +117,9 @@ class GoogleHealthClient:
         """Exchange the refresh_token for a new access token."""
         token = self._load_token()
         if not token or not token.get("refresh_token"):
-            log.warning("No refresh token available — re-authorization required.")
-            return
+            raise RuntimeError(
+                f"No refresh token in {TOKEN_FILE} — re-run the interactive authorization (README step 4)."
+            )
         _TRANSIENT = {429, 500, 502, 503, 504}
         _MAX_ATTEMPTS = 3
         for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -154,6 +159,11 @@ class GoogleHealthClient:
     def ensure_authorized(self):
         """Authorize if no token exists yet, otherwise refresh if expired."""
         if not os.path.exists(TOKEN_FILE):
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    f"No Google Health token at {TOKEN_FILE} and no terminal to authorize with — "
+                    "run the interactive authorization once (README step 4)."
+                )
             self.authorize()
         else:
             self._ensure_token_fresh()

@@ -79,7 +79,9 @@ class TestFitGeneration(unittest.TestCase):
         for field in first_activity:
             print(f"  {field.name} ({field.def_num}): {field.value}")
 
-        self.assertEqual(first_activity.get_value("steps"), 20)
+        # 10 steps in the first minute; cycles are cumulative within the segment.
+        self.assertEqual(first_activity.get_value("steps"), 10)
+        self.assertEqual(activity_msgs[-1].get_value("steps"), 1200)
         self.assertEqual(first_activity.get_value("activity_type"), "walking")
         self.assertIsNone(first_activity.get_value("heart_rate"))
         self.assertEqual(hr_msgs[0].get_value("heart_rate"), 70)
@@ -298,6 +300,14 @@ class TestUploadDuplicate(unittest.TestCase):
         self.assertEqual(result, {"status": "duplicate"})
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
+
+    def test_unrelated_error_containing_409_is_not_a_duplicate(self):
+        post = self.client._client.client.post
+        post.side_effect = Exception("API Error 502 - upstream request id 4095 failed")
+        with patch("time.sleep"):
+            with self.assertRaises(Exception):
+                self.client.upload_fit(b"fit")
+        self.assertEqual(post.call_count, 3)
 
     def test_other_errors_still_retry_then_raise(self):
         post = self.client._client.client.post
