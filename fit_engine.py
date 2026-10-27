@@ -172,7 +172,10 @@ def _monitoring_messages(points: list[dict]) -> bytes:
     records = defn_activity + defn_hr
 
     # Calculate segment-relative cumulative steps (reset at segment start)
-    segment_start_cumulative = points[0].get("cumulative_steps", 0) if points else 0
+    # The first point's own steps belong to this segment, so exclude them from the offset.
+    segment_start_cumulative = (
+        points[0].get("cumulative_steps", 0) - points[0].get("steps_delta", 0) if points else 0
+    )
 
     for pt in points:
         ts = to_garmin_ts(pt["datetime"])
