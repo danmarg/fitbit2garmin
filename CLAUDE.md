@@ -13,7 +13,7 @@ pip install -r requirements.txt
 python main.py
 
 # Run all tests
-pytest test_pipeline_logic.py -v
+pytest test_google_health_client.py test_pipeline_logic.py -v
 
 # Run a single test class
 pytest test_pipeline_logic.py::TestSplitSegments -v
