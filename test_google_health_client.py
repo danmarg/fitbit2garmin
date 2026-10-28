@@ -56,6 +56,24 @@ class TestCombined(unittest.TestCase):
         self.assertEqual(by_dt[after]["heart_rate"], 60)
         self.assertEqual(points, sorted(points, key=lambda p: p["datetime"]))
 
+    def test_minutes_without_heart_rate_or_steps_are_dropped(self):
+        client = GoogleHealthClient("id", "secret")
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        t = lambda m: iso(now - timedelta(minutes=m))
+        hr = [hr_roll(t(10), 60)]
+        steps = [step_roll(t(10), "0"), step_roll(t(9), "0"), step_roll(t(8), "5")]
+
+        with patch.object(client, "get_user_timezone", return_value="UTC"), \
+             patch.object(client, "_roll_up_minutes", side_effect=lambda dt, *_: hr if dt == "heart-rate" else steps):
+            points, _ = client.get_combined_intraday(lookback_hours=1)
+        self.assertEqual([(p["heart_rate"], p["steps_delta"]) for p in points], [(60, 0), (None, 5)])
+
+    def test_unparseable_heart_rate_is_logged(self):
+        with self.assertLogs("google_health_client", level="WARNING") as cm:
+            out = GoogleHealthClient.parse_heart_rate([{"startTime": "2026-03-11T10:00:00Z", "heartRate": {"unexpected": 1}}])
+        self.assertEqual(out, {})
+        self.assertIn("had no beatsPerMinuteAvg", cm.output[0])
+
     def test_rollup_request_shape_and_paging(self):
         client = GoogleHealthClient("id", "secret")
         pages = [{"rollupDataPoints": [step_roll("2026-03-11T10:00:00Z", "1")], "nextPageToken": "t"},

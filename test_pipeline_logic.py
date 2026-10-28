@@ -89,6 +89,23 @@ class TestFitGeneration(unittest.TestCase):
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
 
 @unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+class TestMissingHeartRate(unittest.TestCase):
+    def test_no_hr_record_for_minutes_without_heart_rate(self):
+        base = datetime(2026, 3, 10, 10, 0, 0, tzinfo=timezone.utc)
+        pts = [
+            {"datetime": base, "heart_rate": 70, "steps_delta": 0, "cumulative_steps": 0},
+            {"datetime": base + timedelta(minutes=1), "heart_rate": None, "steps_delta": 5, "cumulative_steps": 5},
+            {"datetime": base + timedelta(minutes=2), "heart_rate": 0, "steps_delta": 0, "cumulative_steps": 5},
+        ]
+        fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
+        with open("test_output_nohr.fit", "wb") as f:
+            f.write(fit_bytes)
+        msgs = list(fitparse.FitFile("test_output_nohr.fit").get_messages("monitoring"))
+        hr = [m.get_value("heart_rate") for m in msgs if m.get_value("heart_rate") is not None]
+        self.assertEqual(hr, [70])
+
+
+@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
 class TestLocalTimestamp(unittest.TestCase):
     """Verify that the FIT monitoring_info local_timestamp reflects the UTC offset."""
 

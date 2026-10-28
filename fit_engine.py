@@ -179,15 +179,16 @@ def _monitoring_messages(points: list[dict]) -> bytes:
 
     for pt in points:
         ts = to_garmin_ts(pt["datetime"])
-        hr = max(0, min(255, pt.get("heart_rate", 0)))
+        hr = pt.get("heart_rate")  # None/0 means "no reading"; Garmin shows 0 bpm as no data
         # Segment-relative cumulative: steps accumulated within this segment only
         steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
         cycles = max(0, steps_cum_in_segment)
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
-        # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
-        records += _data_record(4, [ts + 1, hr], "IB")
+        if hr:
+            # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
+            records += _data_record(4, [ts + 1, max(1, min(255, hr))], "IB")
     return records
 
 
