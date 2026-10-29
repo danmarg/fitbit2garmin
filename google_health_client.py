@@ -33,6 +33,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     "https://www.googleapis.com/auth/googlehealth.settings.readonly",
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
 ]
 SETTINGS_URL = "https://health.googleapis.com/v4/users/me/settings"
 PAGE_SIZE = 10000
@@ -243,6 +244,75 @@ class GoogleHealthClient:
                 continue
             out[_floor_minute(_parse_time(r["startTime"]))] = int(count)
         return out
+
+    def _list_points(self, data_type: str, filter_expr: str, page_size: int) -> list[dict]:
+        """GET users/me/dataTypes/{data_type}/dataPoints (list), following nextPageToken."""
+        params = {"filter": filter_expr, "pageSize": page_size}
+        points: list[dict] = []
+        while True:
+            resp = self.http.get(
+                f"{API_BASE}/{data_type}/dataPoints", headers=self._auth_headers(), params=params
+            )
+            if not resp.ok:
+                log.error("Google Health %s list failed: %d %s", data_type, resp.status_code, resp.text)
+                resp.raise_for_status()
+            body = resp.json()
+            points.extend(body.get("dataPoints", []))
+            if not body.get("nextPageToken"):
+                return points
+            params["pageToken"] = body["nextPageToken"]
+
+    # Stage names -> the four Garmin levels; CLASSIC logs use ASLEEP/RESTLESS.
+    _STAGE_ALIASES = {"ASLEEP": "LIGHT", "RESTLESS": "AWAKE"}
+
+    @classmethod
+    def parse_sleep_sessions(cls, data_points: list[dict], min_minutes: int = 0) -> list[dict]:
+        """
+        Turn `sleep` data points into
+        [{"id", "start", "end", "utc_offset_seconds", "stages": [{"start","end","type"}]}] (UTC, by end time).
+        Sessions shorter than `min_minutes` (naps) are dropped.
+        """
+        out = []
+        for dp in data_points:
+            s = dp.get("sleep") or {}
+            interval = s.get("interval") or {}
+            if not interval.get("startTime") or not interval.get("endTime"):
+                continue
+            start, end = _parse_time(interval["startTime"]), _parse_time(interval["endTime"])
+            if (end - start) < timedelta(minutes=min_minutes):
+                continue
+            stages = []
+            for st in s.get("stages") or []:
+                if not st.get("startTime") or not st.get("endTime"):
+                    continue
+                kind = str(st.get("type", "")).upper()
+                stages.append({
+                    "start": _parse_time(st["startTime"]),
+                    "end": _parse_time(st["endTime"]),
+                    "type": cls._STAGE_ALIASES.get(kind, kind),
+                })
+            if not stages:
+                log.info("Sleep session %s has no stages; skipping.", dp.get("name"))
+                continue
+            offset = interval.get("endUtcOffset") or interval.get("startUtcOffset") or "0s"
+            out.append({
+                "id": dp.get("name"),
+                "start": start,
+                "end": end,
+                "utc_offset_seconds": int(float(str(offset).rstrip("s"))),
+                "stages": sorted(stages, key=lambda x: x["start"]),
+            })
+        return sorted(out, key=lambda x: x["end"])
+
+    def get_sleep_sessions(self, lookback_hours: int = 36, min_minutes: int = 180) -> list[dict]:
+        """Sleep sessions that ended within the last `lookback_hours` hours."""
+        since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        points = self._list_points(
+            "sleep", f'sleep.interval.end_time >= "{since.strftime("%Y-%m-%dT%H:%M:%SZ")}"', page_size=25
+        )
+        sessions = self.parse_sleep_sessions(points, min_minutes=min_minutes)
+        log.info("Google Health sleep: %d session(s) in the last %dh", len(sessions), lookback_hours)
+        return sessions
 
     def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:
         """

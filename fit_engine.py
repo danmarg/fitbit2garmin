@@ -24,6 +24,10 @@ MESG_NUM_FILE_ID = 0
 MESG_NUM_DEVICE_INFO = 23
 MESG_NUM_MONITORING = 55
 MESG_NUM_MONITORING_INFO = 103
+MESG_NUM_SLEEP_LEVEL = 275
+
+# Garmin sleep_level enum (0 = unmeasurable)
+SLEEP_LEVELS = {"AWAKE": 1, "LIGHT": 2, "DEEP": 3, "REM": 4}
 
 # Field definitions (field_def_num, size_bytes, base_type)
 # Base types: 0x84=uint16, 0x86=uint32, 0x02=uint8, 0x07=string, 0x8C=uint32z
@@ -197,6 +201,22 @@ def _monitoring_messages(points: list[dict]) -> bytes:
 # Top-level encoder
 # ---------------------------------------------------------------------------
 
+def _wrap_fit(messages: bytes) -> bytes:
+    """Prepend the 14-byte FIT header and append the file CRC."""
+    header = struct.pack(
+        "<BBHI4sH",
+        14,                    # header size
+        FIT_PROTOCOL_VERSION,
+        int(FIT_PROFILE_VERSION),
+        len(messages),
+        b".FIT",
+        0x0000,                # header CRC placeholder (filled below)
+    )
+    header = header[:12] + struct.pack("<H", fit_crc(header[:12]))
+    raw = header + messages
+    return raw + struct.pack("<H", fit_crc(raw))
+
+
 def build_monitoring_fit(
     points: list[dict],
     manufacturer: int,
@@ -236,23 +256,8 @@ def build_monitoring_fit(
     messages += _monitoring_info_message(first_ts, utc_offset_seconds)
     messages += _monitoring_messages(points)
 
-    # FIT file header (14 bytes)
-    data_size = len(messages)
-    header = struct.pack(
-        "<BBHI4sH",
-        14,                    # header size
-        FIT_PROTOCOL_VERSION,
-        int(FIT_PROFILE_VERSION),
-        data_size,
-        b".FIT",
-        0x0000,                # header CRC placeholder (filled below)
-    )
-    header_crc = fit_crc(header[:12])
-    header = header[:12] + struct.pack("<H", header_crc)
-
-    raw = header + messages
-    file_crc = fit_crc(raw)
-    raw += struct.pack("<H", file_crc)
+    raw = _wrap_fit(messages)
+    file_crc = int.from_bytes(raw[-2:], "little")
 
     log.info(
         "Built FIT file: %d points, %d bytes, CRC=0x%04X",
@@ -260,4 +265,56 @@ def build_monitoring_fit(
         len(raw),
         file_crc,
     )
+    return raw
+
+
+def _sleep_level_messages(stages: list[dict]) -> bytes:
+    """
+    Emit sleep_level definition + one record per minute of each sleep stage.
+
+    stages: [{"start": datetime, "end": datetime, "type": "AWAKE|LIGHT|DEEP|REM"}, ...]
+    Stages are non-overlapping; unknown types are skipped. Timestamps are ascending.
+    """
+    records = _definition_record(3, MESG_NUM_SLEEP_LEVEL, [
+        (253, 4, UINT32),  # timestamp
+        (0,   1, ENUM),    # sleep_level
+    ])
+    last_ts = -1
+    for st in sorted(stages, key=lambda x: x["start"]):
+        level = SLEEP_LEVELS.get(st["type"])
+        if level is None:
+            continue
+        for ts in range(to_garmin_ts(st["start"]), to_garmin_ts(st["end"]), 60):
+            if ts <= last_ts:
+                continue  # never go backwards if stages overlap
+            records += _data_record(3, [ts, level], "IB")
+            last_ts = ts
+    return records
+
+
+def build_sleep_fit(
+    stages: list[dict],
+    manufacturer: int,
+    product_id: int,
+    serial_number: int,
+    software_version: int = 331,
+    utc_offset_seconds: int = 0,
+) -> bytes:
+    """
+    Build a monitoring FIT file (type 32) carrying one night's sleep_level records.
+
+    Experimental: whether Garmin Connect stores or displays this is unverified.
+    """
+    stages = [s for s in stages if s["type"] in SLEEP_LEVELS and s["end"] > s["start"]]
+    if not stages:
+        raise ValueError("No sleep stages provided")
+
+    first_ts = to_garmin_ts(min(s["start"] for s in stages))
+    messages = b""
+    messages += _file_id_messages(manufacturer, product_id, serial_number, first_ts)
+    messages += _device_info_messages(manufacturer, product_id, serial_number, first_ts, software_version)
+    messages += _monitoring_info_message(first_ts, utc_offset_seconds)
+    messages += _sleep_level_messages(stages)
+    raw = _wrap_fit(messages)
+    log.info("Built sleep FIT file: %d stage(s), %d bytes", len(stages), len(raw))
     return raw

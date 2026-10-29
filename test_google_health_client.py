@@ -127,5 +127,39 @@ class TestAuthGuards(unittest.TestCase):
             self.client.ensure_authorized()
 
 
+def sleep_point(start, end, stages, offset="3600s"):
+    return {
+        "name": f"users/me/dataTypes/sleep/dataPoints/{start}",
+        "sleep": {
+            "interval": {"startTime": start, "startUtcOffset": offset, "endTime": end, "endUtcOffset": offset},
+            "type": "STAGES",
+            "stages": [{"startTime": a, "endTime": b, "type": t} for a, b, t in stages],
+        },
+    }
+
+
+class TestSleepParsing(unittest.TestCase):
+    def test_sessions_parsed_sorted_and_naps_dropped(self):
+        night = sleep_point("2026-10-28T22:00:00Z", "2026-10-29T06:00:00Z", [
+            ("2026-10-28T22:00:00Z", "2026-10-28T23:30:00Z", "light"),
+            ("2026-10-28T23:30:00Z", "2026-10-29T01:00:00Z", "DEEP"),
+            ("2026-10-29T01:00:00Z", "2026-10-29T06:00:00Z", "RESTLESS"),
+        ])
+        nap = sleep_point("2026-10-28T13:00:00Z", "2026-10-28T13:40:00Z", [("2026-10-28T13:00:00Z", "2026-10-28T13:40:00Z", "LIGHT")])
+        out = GoogleHealthClient.parse_sleep_sessions([night, nap], min_minutes=180)
+        self.assertEqual(len(out), 1)
+        s = out[0]
+        self.assertEqual(s["utc_offset_seconds"], 3600)
+        self.assertEqual([x["type"] for x in s["stages"]], ["LIGHT", "DEEP", "AWAKE"])
+        self.assertEqual(s["end"], datetime(2026, 10, 29, 6, tzinfo=timezone.utc))
+
+    def test_sleep_filter_uses_end_time(self):
+        client = GoogleHealthClient("id", "secret")
+        with patch.object(client, "_list_points", return_value=[]) as lp:
+            client.get_sleep_sessions(lookback_hours=36)
+        self.assertEqual(lp.call_args.args[0], "sleep")
+        self.assertIn("sleep.interval.end_time >=", lp.call_args.args[1])
+
+
 if __name__ == "__main__":
     unittest.main()

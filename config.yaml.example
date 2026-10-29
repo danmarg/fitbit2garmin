@@ -25,6 +25,10 @@ sync:
   lookback_hours: 4     # How many hours back to pull from Google Health
   recency_minutes: 60   # Don't upload data newer than this many minutes;
                         # gives the real Garmin device time to sync first
+  sleep:                 # experimental: send Google Health sleep stages to Garmin
+    enabled: false
+    lookback_hours: 36   # sleep sessions that ended within this window
+    min_minutes: 180     # shorter sessions (naps) are ignored
   hooks:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"
