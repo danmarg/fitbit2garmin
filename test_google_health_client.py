@@ -69,7 +69,7 @@ class TestCombined(unittest.TestCase):
         self.assertEqual([(p["heart_rate"], p["steps_delta"]) for p in points], [(60, 0), (None, 5)])
 
     def test_unparseable_heart_rate_is_logged(self):
-        with self.assertLogs("google_health_client", level="WARNING") as cm:
+        with self.assertLogs("google_health_client", level="INFO") as cm:
             out = GoogleHealthClient.parse_heart_rate([{"startTime": "2026-03-11T10:00:00Z", "heartRate": {"unexpected": 1}}])
         self.assertEqual(out, {})
         self.assertIn("had no beatsPerMinuteAvg", cm.output[0])

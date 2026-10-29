@@ -223,9 +223,11 @@ class GoogleHealthClient:
             if r.get("startTime") is None or avg is None:
                 unusable.append(r)
                 continue
+            if float(avg) < 1:
+                continue  # not a plausible reading; treat as no heart rate
             out[_floor_minute(_parse_time(r["startTime"]))] = round(float(avg))
         if unusable:
-            log.warning(
+            log.info(
                 "%d of %d heart-rate rollup window(s) had no beatsPerMinuteAvg; first: %.300s",
                 len(unusable), len(rollups), json.dumps(unusable[0]),
             )

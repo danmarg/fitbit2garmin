@@ -148,8 +148,9 @@ def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0) -> bytes:
 
 def _monitoring_messages(points: list[dict]) -> bytes:
     """
-    Emit monitoring definitions + two records per intraday point.
-    points: [{"datetime": datetime, "heart_rate": int, "cumulative_steps": int, "steps_delta": int}, ...]
+    Emit monitoring definitions, then an activity record per intraday point plus an HR
+    record for each point that has a heart rate (None/0 means no reading: no HR record).
+    points: [{"datetime": datetime, "heart_rate": int | None, "cumulative_steps": int, "steps_delta": int}, ...]
 
     Real Garmin devices emit separate monitoring records for activity/steps vs heart rate.
     When activity_type is present in a monitoring record, Garmin treats it as an activity
@@ -186,7 +187,7 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
-        if hr:
+        if hr and hr > 0:
             # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
             records += _data_record(4, [ts + 1, max(1, min(255, hr))], "IB")
     return records

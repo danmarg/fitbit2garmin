@@ -1,4 +1,5 @@
 
+import io
 import json
 import os
 import sys
@@ -95,9 +96,7 @@ class TestFileCreatedTime(unittest.TestCase):
         pts = [{"datetime": base + timedelta(minutes=i), "heart_rate": 60, "steps_delta": 0, "cumulative_steps": 0}
                for i in range(5)]
         fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
-        with open("test_output_created.fit", "wb") as f:
-            f.write(fit_bytes)
-        file_id = next(fitparse.FitFile("test_output_created.fit").get_messages("file_id"))
+        file_id = next(fitparse.FitFile(io.BytesIO(fit_bytes)).get_messages("file_id"))
         self.assertEqual(file_id.get_value("time_created").replace(tzinfo=timezone.utc), base)
 
 
@@ -111,9 +110,7 @@ class TestMissingHeartRate(unittest.TestCase):
             {"datetime": base + timedelta(minutes=2), "heart_rate": 0, "steps_delta": 0, "cumulative_steps": 5},
         ]
         fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
-        with open("test_output_nohr.fit", "wb") as f:
-            f.write(fit_bytes)
-        msgs = list(fitparse.FitFile("test_output_nohr.fit").get_messages("monitoring"))
+        msgs = list(fitparse.FitFile(io.BytesIO(fit_bytes)).get_messages("monitoring"))
         hr = [m.get_value("heart_rate") for m in msgs if m.get_value("heart_rate") is not None]
         self.assertEqual(hr, [70])
 
