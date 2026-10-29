@@ -221,10 +221,12 @@ def build_monitoring_fit(
         raise ValueError("No data points provided")
 
     first_ts = to_garmin_ts(points[0]["datetime"])
-    # file_id.time_created should be when the file is created (now), not the
-    # first data point.  Garmin deduplicates on (serial_number, time_created),
-    # so using first_ts causes 409 Conflict on every retry for the same window.
-    file_created_ts = to_garmin_ts(datetime.now(timezone.utc))
+    # file_id.time_created is the start of the logged period, as on real devices.
+    # Setting it to the upload time instead made Garmin keep only the last record(s)
+    # of each segment (records older than time_created were dropped), leaving gaps.
+    # Garmin deduplicates on (serial_number, time_created); a retry of the same
+    # window then returns 409, which upload_fit treats as already uploaded.
+    file_created_ts = first_ts
 
     # Build message payload
     messages = b""

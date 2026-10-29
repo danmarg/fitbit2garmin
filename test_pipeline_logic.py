@@ -89,6 +89,19 @@ class TestFitGeneration(unittest.TestCase):
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
 
 @unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+class TestFileCreatedTime(unittest.TestCase):
+    def test_time_created_is_first_data_point(self):
+        base = datetime(2026, 3, 10, 10, 0, 0, tzinfo=timezone.utc)
+        pts = [{"datetime": base + timedelta(minutes=i), "heart_rate": 60, "steps_delta": 0, "cumulative_steps": 0}
+               for i in range(5)]
+        fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
+        with open("test_output_created.fit", "wb") as f:
+            f.write(fit_bytes)
+        file_id = next(fitparse.FitFile("test_output_created.fit").get_messages("file_id"))
+        self.assertEqual(file_id.get_value("time_created").replace(tzinfo=timezone.utc), base)
+
+
+@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
 class TestMissingHeartRate(unittest.TestCase):
     def test_no_hr_record_for_minutes_without_heart_rate(self):
         base = datetime(2026, 3, 10, 10, 0, 0, tzinfo=timezone.utc)
