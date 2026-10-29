@@ -148,8 +148,9 @@ def _monitoring_info_message(ts: int, utc_offset_seconds: int = 0) -> bytes:
 
 def _monitoring_messages(points: list[dict]) -> bytes:
     """
-    Emit monitoring definitions + two records per intraday point.
-    points: [{"datetime": datetime, "heart_rate": int, "cumulative_steps": int, "steps_delta": int}, ...]
+    Emit monitoring definitions, then an activity record per intraday point plus an HR
+    record for each point that has a heart rate (None/0 means no reading: no HR record).
+    points: [{"datetime": datetime, "heart_rate": int | None, "cumulative_steps": int, "steps_delta": int}, ...]
 
     Real Garmin devices emit separate monitoring records for activity/steps vs heart rate.
     When activity_type is present in a monitoring record, Garmin treats it as an activity
@@ -179,15 +180,16 @@ def _monitoring_messages(points: list[dict]) -> bytes:
 
     for pt in points:
         ts = to_garmin_ts(pt["datetime"])
-        hr = max(0, min(255, pt.get("heart_rate", 0)))
+        hr = pt.get("heart_rate")  # None/0 means "no reading"; Garmin shows 0 bpm as no data
         # Segment-relative cumulative: steps accumulated within this segment only
         steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
         cycles = max(0, steps_cum_in_segment)
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
-        # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
-        records += _data_record(4, [ts + 1, hr], "IB")
+        if hr and hr > 0:
+            # Offset HR record by 1 second to avoid Garmin aggregating cycles across records
+            records += _data_record(4, [ts + 1, max(1, min(255, hr))], "IB")
     return records
 
 
@@ -220,10 +222,12 @@ def build_monitoring_fit(
         raise ValueError("No data points provided")
 
     first_ts = to_garmin_ts(points[0]["datetime"])
-    # file_id.time_created should be when the file is created (now), not the
-    # first data point.  Garmin deduplicates on (serial_number, time_created),
-    # so using first_ts causes 409 Conflict on every retry for the same window.
-    file_created_ts = to_garmin_ts(datetime.now(timezone.utc))
+    # file_id.time_created is the start of the logged period, as on real devices.
+    # Setting it to the upload time instead made Garmin keep only the last record(s)
+    # of each segment (records older than time_created were dropped), leaving gaps.
+    # Garmin deduplicates on (serial_number, time_created); a retry of the same
+    # window then returns 409, which upload_fit treats as already uploaded.
+    file_created_ts = first_ts
 
     # Build message payload
     messages = b""

@@ -217,11 +217,20 @@ class GoogleHealthClient:
     def parse_heart_rate(rollups: list[dict]) -> dict[datetime, int]:
         """Map each 60s heart-rate rollup to {UTC minute: mean bpm}."""
         out: dict[datetime, int] = {}
+        unusable = []
         for r in rollups:
             avg = (r.get("heartRate") or {}).get("beatsPerMinuteAvg")
             if r.get("startTime") is None or avg is None:
+                unusable.append(r)
                 continue
+            if float(avg) < 1:
+                continue  # not a plausible reading; treat as no heart rate
             out[_floor_minute(_parse_time(r["startTime"]))] = round(float(avg))
+        if unusable:
+            log.info(
+                "%d of %d heart-rate rollup window(s) had no beatsPerMinuteAvg; first: %.300s",
+                len(unusable), len(rollups), json.dumps(unusable[0]),
+            )
         return out
 
     @staticmethod
@@ -242,7 +251,7 @@ class GoogleHealthClient:
 
         Returns a tuple of:
           - list of dicts:
-              [{"datetime": datetime (UTC aware), "heart_rate": int, "steps_delta": int, "cumulative_steps": int}, ...]
+              [{"datetime": datetime (UTC aware), "heart_rate": int | None, "steps_delta": int, "cumulative_steps": int}, ...]
               sorted ascending by time.
           - utc_offset_seconds: the user's current UTC offset in whole seconds (e.g. 3600 for UTC+1)
         """
@@ -288,16 +297,24 @@ class GoogleHealthClient:
             if dt < cutoff_utc or dt > now_utc:
                 continue
 
+            heart_rate = hr_by_minute.get(dt)
+            if heart_rate is None and steps_delta == 0:
+                continue  # nothing to report for this minute (e.g. a true-zero steps window)
+
             merged.append(
                 {
                     "datetime": dt,
-                    "heart_rate": hr_by_minute.get(dt, 0),
+                    "heart_rate": heart_rate,
                     "steps_delta": steps_delta,
                     "cumulative_steps": cumulative_steps,
                 }
             )
 
-        log.info("Got %d merged intraday points for last %dh", len(merged), lookback_hours)
+        log.info(
+            "Got %d merged intraday points for last %dh (%d with heart rate, %d with steps)",
+            len(merged), lookback_hours,
+            sum(1 for p in merged if p["heart_rate"]), sum(1 for p in merged if p["steps_delta"]),
+        )
         # Current UTC offset for the user's timezone (handles DST automatically)
         utc_offset = now_utc.astimezone(local_tz).utcoffset()
         utc_offset_seconds = int(utc_offset.total_seconds()) if utc_offset is not None else 0

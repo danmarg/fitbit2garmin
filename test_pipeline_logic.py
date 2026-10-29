@@ -1,4 +1,5 @@
 
+import io
 import json
 import os
 import sys
@@ -87,6 +88,32 @@ class TestFitGeneration(unittest.TestCase):
         self.assertEqual(hr_msgs[0].get_value("heart_rate"), 70)
 
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
+
+@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+class TestFileCreatedTime(unittest.TestCase):
+    def test_time_created_is_first_data_point(self):
+        base = datetime(2026, 3, 10, 10, 0, 0, tzinfo=timezone.utc)
+        pts = [{"datetime": base + timedelta(minutes=i), "heart_rate": 60, "steps_delta": 0, "cumulative_steps": 0}
+               for i in range(5)]
+        fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
+        file_id = next(fitparse.FitFile(io.BytesIO(fit_bytes)).get_messages("file_id"))
+        self.assertEqual(file_id.get_value("time_created").replace(tzinfo=timezone.utc), base)
+
+
+@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+class TestMissingHeartRate(unittest.TestCase):
+    def test_no_hr_record_for_minutes_without_heart_rate(self):
+        base = datetime(2026, 3, 10, 10, 0, 0, tzinfo=timezone.utc)
+        pts = [
+            {"datetime": base, "heart_rate": 70, "steps_delta": 0, "cumulative_steps": 0},
+            {"datetime": base + timedelta(minutes=1), "heart_rate": None, "steps_delta": 5, "cumulative_steps": 5},
+            {"datetime": base + timedelta(minutes=2), "heart_rate": 0, "steps_delta": 0, "cumulative_steps": 5},
+        ]
+        fit_bytes = build_monitoring_fit(points=pts, manufacturer=1, product_id=3993, serial_number=1)
+        msgs = list(fitparse.FitFile(io.BytesIO(fit_bytes)).get_messages("monitoring"))
+        hr = [m.get_value("heart_rate") for m in msgs if m.get_value("heart_rate") is not None]
+        self.assertEqual(hr, [70])
+
 
 @unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
 class TestLocalTimestamp(unittest.TestCase):
