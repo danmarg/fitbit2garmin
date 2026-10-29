@@ -93,6 +93,17 @@ Open the printed URL in your browser, approve access, then paste the redirect UR
 
 ---
 
+## Sleep (experimental)
+
+Off by default. When `sync.sleep.enabled` is `true`, each cycle also sends your Google Health sleep sessions to Garmin as sleep-stage records (awake, light, deep, REM, one per minute).
+
+- It needs the `googlehealth.sleep.readonly` scope. Tokens created before this feature don't have it, so run the authorization step (§4) again.
+- A night is **skipped if Garmin already has sleep for that date**, for example from a real watch, so it never replaces your watch's data. Sessions shorter than `min_minutes` (naps) are ignored, and sleep that ended within `recency_minutes` waits.
+- Whether Garmin Connect stores and displays imported sleep, and how its sleep score and recovery numbers react to it, is untested. Try it on a night without watch data first.
+- HRV is not imported.
+
+---
+
 ## Running Locally
 
 ```bash

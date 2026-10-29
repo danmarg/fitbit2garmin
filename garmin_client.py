@@ -101,6 +101,19 @@ class GarminClient:
             log.info("Skipping %d point(s) already present on Garmin Connect.", removed)
         return filtered
 
+    def has_sleep(self, date: str) -> bool:
+        """
+        True if Garmin already has sleep for the given wake-up date (YYYY-MM-DD).
+        On error, answers True so a real watch's night is never overwritten.
+        """
+        self._ensure_connected()
+        try:
+            dto = (self._client.get_sleep_data(date) or {}).get("dailySleepDTO") or {}
+            return bool(dto.get("sleepTimeSeconds"))
+        except Exception as e:
+            log.warning("Could not check Garmin sleep for %s (%s) — assuming it exists.", date, e)
+            return True
+
     # ------------------------------------------------------------------
     # Upload
     # ------------------------------------------------------------------

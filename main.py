@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import yaml
 
 from google_health_client import GoogleHealthClient
-from fit_engine import build_monitoring_fit
+from fit_engine import build_monitoring_fit, build_sleep_fit
 from garmin_client import GarminClient
 
 logging.basicConfig(
@@ -45,6 +45,22 @@ class StateStore:
         return None
 
     def save_last_uploaded(self, dt: datetime):
+        self._save("last_uploaded_ts", dt)
+
+    def load_last_sleep_end(self) -> datetime | None:
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("last_sleep_end_ts")
+            if raw:
+                return datetime.fromisoformat(raw)
+        except (FileNotFoundError, KeyError, ValueError):
+            pass
+        return None
+
+    def save_last_sleep_end(self, dt: datetime):
+        self._save("last_sleep_end_ts", dt)
+
+    def _save(self, key: str, dt: datetime):
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         data = {}
         try:
@@ -52,10 +68,10 @@ class StateStore:
                 data = json.load(f)
         except (FileNotFoundError, ValueError):
             pass
-        data["last_uploaded_ts"] = dt.isoformat()
+        data[key] = dt.isoformat()
         with open(self.path, "w") as f:
             json.dump(data, f, indent=2)
-        log.debug("State saved: last_uploaded_ts=%s", dt.isoformat())
+        log.debug("State saved: %s=%s", key, dt.isoformat())
 
 
 def load_config(path: str) -> dict:
@@ -188,6 +204,49 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
     log.info("=== Fitbit2Garmin cycle done ===")
 
 
+def run_sleep_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state: StateStore):
+    """
+    Experimental: upload Google Health sleep sessions as sleep_level FIT records.
+
+    Off unless sync.sleep.enabled is true. A night is skipped if Garmin already has
+    sleep for that date (e.g. from a real watch), is still inside the recency buffer,
+    or ended at or before the sleep watermark.
+    """
+    sleep_cfg = cfg["sync"].get("sleep") or {}
+    if not sleep_cfg.get("enabled"):
+        return
+    device = cfg["device"]
+    recency_cutoff = datetime.now(timezone.utc) - timedelta(minutes=cfg["sync"].get("recency_minutes", 60))
+    last_end = state.load_last_sleep_end()
+
+    sessions = health.get_sleep_sessions(
+        lookback_hours=sleep_cfg.get("lookback_hours", 36),
+        min_minutes=sleep_cfg.get("min_minutes", 180),
+    )
+    for s in sessions:
+        if last_end is not None and s["end"] <= last_end:
+            continue
+        if s["end"] > recency_cutoff:
+            log.info("Sleep session ending %s is inside the recency buffer — later.", s["end"].isoformat())
+            continue
+        wake_date = (s["end"] + timedelta(seconds=s["utc_offset_seconds"])).strftime("%Y-%m-%d")
+        if garmin.has_sleep(wake_date):
+            log.info("Garmin already has sleep for %s — not uploading.", wake_date)
+            state.save_last_sleep_end(s["end"])
+            continue
+        fit_bytes = build_sleep_fit(
+            stages=s["stages"],
+            manufacturer=device["manufacturer"],
+            product_id=device["product_id"],
+            serial_number=device["serial_number"],
+            software_version=device.get("software_version", 331),
+            utc_offset_seconds=s["utc_offset_seconds"],
+        )
+        result = garmin.upload_fit_for_window(fit_bytes, s["start"])
+        log.info("Sleep upload for %s complete: %s", wake_date, result)
+        state.save_last_sleep_end(s["end"])
+
+
 def main():
     cfg = load_config(CONFIG_FILE)
     state = StateStore(STATE_FILE)
@@ -209,6 +268,11 @@ def main():
 
     try:
         run_sync(cfg, health, garmin, state)
+        try:
+            run_sleep_sync(cfg, health, garmin, state)
+        except Exception:
+            # Experimental feature: never fail the heart-rate sync because of it.
+            log.exception("Sleep sync failed (continuing)")
         run_hook(hooks.get("on_success"))
     except Exception as e:
         log.exception("Sync cycle failed: %s", e)

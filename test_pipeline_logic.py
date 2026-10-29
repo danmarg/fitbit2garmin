@@ -20,7 +20,7 @@ try:
 except ImportError:
     HAS_FITPARSE = False
 
-from fit_engine import build_monitoring_fit, GARMIN_EPOCH
+from fit_engine import build_monitoring_fit, build_sleep_fit, GARMIN_EPOCH
 
 @unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
 class TestFitGeneration(unittest.TestCase):
@@ -88,6 +88,80 @@ class TestFitGeneration(unittest.TestCase):
         self.assertEqual(hr_msgs[0].get_value("heart_rate"), 70)
 
         print(f"\nSUCCESS: Engine logic verified. FIT file correctly encoded with {len(monitoring_msgs)} points.")
+
+class TestSleepFit(unittest.TestCase):
+    def _stages(self):
+        t = datetime(2026, 10, 28, 22, 0, tzinfo=timezone.utc)
+        m = lambda a, b, kind: {"start": t + timedelta(minutes=a), "end": t + timedelta(minutes=b), "type": kind}
+        return t, [m(0, 60, "LIGHT"), m(60, 90, "DEEP"), m(90, 95, "WEIRD"), m(95, 100, "REM")]
+
+    def test_one_sleep_level_per_minute_ascending(self):
+        from garmin_fit_sdk import Decoder, Stream
+        t, stages = self._stages()
+        fit_bytes = build_sleep_fit(stages, 1, 3993, 3445298263)
+        decoder = Decoder(Stream.from_bytes_io(io.BytesIO(fit_bytes)))
+        self.assertTrue(decoder.is_fit())
+        msgs, errors = decoder.read()
+        self.assertEqual(errors, [])
+        levels = msgs["sleep_level_mesgs"]
+        self.assertEqual(len(levels), 95)  # 60 + 30 + 5; the unknown stage is skipped
+        self.assertEqual([m["sleep_level"] for m in levels[:1] + levels[60:61] + levels[-1:]], ["light", "deep", "rem"])
+        stamps = [m["timestamp"] for m in levels]
+        self.assertEqual(stamps, sorted(set(stamps)))
+        # time_created is the first stage, as in the heart-rate files
+        self.assertEqual(msgs["file_id_mesgs"][0]["time_created"], t)
+
+    def test_no_usable_stages_raises(self):
+        t, _ = self._stages()
+        with self.assertRaises(ValueError):
+            build_sleep_fit([{"start": t, "end": t + timedelta(minutes=5), "type": "WEIRD"}], 1, 3993, 1)
+
+
+class TestRunSleepSync(unittest.TestCase):
+    def setUp(self):
+        import main
+        self.main = main
+        self.tmp = tempfile.mkdtemp()
+        self.state = main.StateStore(os.path.join(self.tmp, "state.json"))
+        self.cfg = {
+            "sync": {"recency_minutes": 60, "sleep": {"enabled": True}},
+            "device": {"manufacturer": 1, "product_id": 3993, "serial_number": 1},
+        }
+        end = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=3)
+        self.session = {
+            "id": "s1", "start": end - timedelta(hours=8), "end": end, "utc_offset_seconds": 3600,
+            "stages": [{"start": end - timedelta(hours=8), "end": end, "type": "LIGHT"}],
+        }
+        self.health = MagicMock()
+        self.health.get_sleep_sessions.return_value = [self.session]
+        self.garmin = MagicMock()
+        self.garmin.has_sleep.return_value = False
+
+    def test_disabled_by_default(self):
+        self.cfg["sync"]["sleep"] = {}
+        self.main.run_sleep_sync(self.cfg, self.health, self.garmin, self.state)
+        self.health.get_sleep_sessions.assert_not_called()
+
+    def test_uploads_and_advances_watermark(self):
+        self.main.run_sleep_sync(self.cfg, self.health, self.garmin, self.state)
+        self.garmin.upload_fit_for_window.assert_called_once()
+        self.assertEqual(self.state.load_last_sleep_end(), self.session["end"])
+        # a second cycle does not upload the same night again
+        self.main.run_sleep_sync(self.cfg, self.health, self.garmin, self.state)
+        self.garmin.upload_fit_for_window.assert_called_once()
+
+    def test_existing_garmin_sleep_is_not_overwritten(self):
+        self.garmin.has_sleep.return_value = True
+        self.main.run_sleep_sync(self.cfg, self.health, self.garmin, self.state)
+        self.garmin.upload_fit_for_window.assert_not_called()
+        self.assertEqual(self.state.load_last_sleep_end(), self.session["end"])
+
+    def test_recent_session_waits_for_real_device(self):
+        self.session["end"] = datetime.now(timezone.utc) - timedelta(minutes=10)
+        self.main.run_sleep_sync(self.cfg, self.health, self.garmin, self.state)
+        self.garmin.upload_fit_for_window.assert_not_called()
+        self.assertIsNone(self.state.load_last_sleep_end())
+
 
 @unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
 class TestFileCreatedTime(unittest.TestCase):
