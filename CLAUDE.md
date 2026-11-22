@@ -43,13 +43,21 @@ This service syncs Fitbit intraday heart rate and step data (read via the Google
 Google Health API (:rollUp, 60s windows, reconciled)
   → 1-min UTC points (google_health_client.py)
   → Recency buffer (hold back last N minutes for real device to sync first)
-  → StateStore watermark filter (skip already-uploaded)
-  → Garmin coverage check (skip minutes already on Garmin, 403 → pass-through)
-  → split_segments (split on >5-min gaps)
-  → build_monitoring_fit per segment (fit_engine.py)
-  → upload_fit_for_window (garmin_client.py)
-  → StateStore.save_last_uploaded
+  → Garmin coverage check (skip minutes with a Garmin HR sample within ±2 min; local dates)
+  → split at StateStore watermark:
+      new (after watermark) → split_segments → build_monitoring_fit → upload → save_last_uploaded
+      old (≤ watermark, still missing on Garmin) → backfill runs ≥ backfill_min_minutes
+          → steps stripped if Garmin already has steps there
+          → time_created shifted 1–3 s earlier per attempt (avoids 409 duplicate)
+          → at most backfill_max_attempts per run (state.json backfill_attempts)
 ```
+
+Garmin behaviour found 2026-11-22 (see diagnose_hr.py on branch claude/hr-sleep-diagnostics):
+- A monitoring file whose cycles never exceed 0 is discarded ("valid type, but contained
+  no content"), HR included. fit_engine adds one walking cycle to zero-step segments.
+- `device.serial_number` must be a device registered to the account (else 419 "Wellness
+  device is not active"), so uploads share an identity with the user's real watch, whose
+  own syncs appear to wipe previously uploaded HR. Backfill re-sends those minutes.
 
 ### Key files
 
@@ -66,7 +74,8 @@ Google Health API (:rollUp, 60s windows, reconciled)
 ### Configuration
 
 Copy `config.yaml.example` → `config.yaml` (git-ignored). Key settings under `sync:`:
-- `lookback_hours` — how far back to fetch from Google Health (default 4)
+- `lookback_hours` — how far back to fetch from Google Health (default 4; the fetch covers `backfill_hours` if larger)
+- `backfill_hours` / `backfill_min_minutes` / `backfill_max_attempts` — re-send gaps Garmin lost (defaults 48 / 10 / 3)
 - `recency_minutes` — hold-back buffer so a real Garmin device can sync first (default 60)
 - `hooks.on_success` / `hooks.on_failure` — optional shell commands (e.g. healthchecks.io)
 
@@ -87,8 +96,8 @@ To customize the Docker schedule, edit `crontab` before building the image, or o
 ### Deduplication layers (in order)
 
 1. **Recency buffer** — drops points newer than `recency_minutes` ago
-2. **StateStore watermark** — `data/state.json` persists `last_uploaded_ts`; skips points ≤ watermark
-3. **Garmin coverage check** — queries wellness API; skips minutes already present. Falls back to pass-through on 403 (StateStore is then the sole guard)
+2. **Garmin coverage check** — queries wellness API; skips minutes already present (±2 min). Falls back to pass-through on error
+3. **StateStore watermark** — `last_uploaded_ts` in state.json; points ≤ watermark are only re-sent as backfill, capped by `backfill_attempts`
 
 ### FIT file details
 

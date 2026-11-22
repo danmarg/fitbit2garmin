@@ -160,6 +160,11 @@ def _monitoring_messages(points: list[dict]) -> bytes:
     Local mesg 4: HR record      — timestamp + heart_rate (no activity_type)
 
     Cycles are cumulative WITHIN THIS SEGMENT ONLY, not from start of day.
+
+    Garmin discards a monitoring file whose cycles never rise above zero ("File was a
+    valid type, but contained no content"), heart rate included. A segment with no steps
+    therefore gets one walking cycle on its first record; Garmin did not show it as a step
+    when tested (2026-11-22).
     """
     defn_activity = _definition_record(3, MESG_NUM_MONITORING, [
         (253, 4, UINT32),  # timestamp
@@ -178,13 +183,18 @@ def _monitoring_messages(points: list[dict]) -> bytes:
         points[0].get("cumulative_steps", 0) - points[0].get("steps_delta", 0) if points else 0
     )
 
-    for pt in points:
+    no_steps = all(pt.get("steps_delta", 0) <= 0 for pt in points)
+
+    for i, pt in enumerate(points):
         ts = to_garmin_ts(pt["datetime"])
         hr = pt.get("heart_rate")  # None/0 means "no reading"; Garmin shows 0 bpm as no data
         # Segment-relative cumulative: steps accumulated within this segment only
         steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
         cycles = max(0, steps_cum_in_segment)
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
+        if no_steps:
+            cycles = 1
+            activity_type = 6 if i == 0 else 0
 
         records += _data_record(3, [ts, cycles, activity_type], "IIB")
         if hr and hr > 0:
@@ -204,9 +214,14 @@ def build_monitoring_fit(
     serial_number: int,
     software_version: int = 331,
     utc_offset_seconds: int = 0,
+    time_created_offset: int = 0,
 ) -> bytes:
     """
     Build a complete, valid Garmin Monitoring FIT file (type 9).
+
+    time_created_offset moves file_id.time_created that many seconds before the first
+    point. Garmin identifies a file by time_created, so a re-upload of the same span
+    needs a different value or it is rejected as a duplicate.
 
     Args:
         points: merged intraday list from GoogleHealthClient.get_combined_intraday()
@@ -227,7 +242,7 @@ def build_monitoring_fit(
     # of each segment (records older than time_created were dropped), leaving gaps.
     # Garmin deduplicates on (serial_number, time_created); a retry of the same
     # window then returns 409, which upload_fit treats as already uploaded.
-    file_created_ts = first_ts
+    file_created_ts = first_ts - time_created_offset
 
     # Build message payload
     messages = b""

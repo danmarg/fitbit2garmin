@@ -25,37 +25,47 @@ logging.basicConfig(
 log = logging.getLogger("fitbit2garmin")
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join("data", "config.yaml"))
-STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY"), "state.json")
+STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "data"), "state.json")
 
 
 class StateStore:
-    """Persist the timestamp of the last successfully uploaded data point."""
+    """Persist sync state: the last uploaded data point and backfill attempts."""
 
     def __init__(self, path: str):
         self.path = path
 
-    def load_last_uploaded(self) -> datetime | None:
-        try:
-            with open(self.path) as f:
-                raw = json.load(f).get("last_uploaded_ts")
-            if raw:
-                return datetime.fromisoformat(raw)
-        except (FileNotFoundError, KeyError, ValueError):
-            pass
-        return None
-
-    def save_last_uploaded(self, dt: datetime):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        data = {}
+    def _load(self) -> dict:
         try:
             with open(self.path) as f:
                 data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except (FileNotFoundError, ValueError):
-            pass
-        data["last_uploaded_ts"] = dt.isoformat()
+            return {}
+
+    def _store(self, key: str, value):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        data = self._load()
+        data[key] = value
         with open(self.path, "w") as f:
             json.dump(data, f, indent=2)
-        log.debug("State saved: last_uploaded_ts=%s", dt.isoformat())
+        log.debug("State saved: %s=%s", key, value)
+
+    def load_last_uploaded(self) -> datetime | None:
+        raw = self._load().get("last_uploaded_ts")
+        try:
+            return datetime.fromisoformat(raw) if raw else None
+        except (TypeError, ValueError):
+            return None
+
+    def save_last_uploaded(self, dt: datetime):
+        self._store("last_uploaded_ts", dt.isoformat())
+
+    def load_backfill_attempts(self) -> dict[str, int]:
+        raw = self._load().get("backfill_attempts")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def save_backfill_attempts(self, attempts: dict[str, int]):
+        self._store("backfill_attempts", attempts)
 
 
 def load_config(path: str) -> dict:
@@ -99,20 +109,59 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     return segments
 
 
+def select_backfill_runs(points: list[dict], min_minutes: int = 10) -> list[list[dict]]:
+    """
+    From already-uploaded-but-missing points, pick runs of heart rate (2-minute holes
+    allowed) spanning at least `min_minutes`, plus any steps-only points inside them.
+    Shorter holes are left alone so Garmin's 2-minute sampling doesn't cause churn.
+    """
+    hr_points = [p for p in points if p.get("heart_rate")]
+    runs = []
+    for run in split_segments(hr_points, gap_minutes=2):
+        if run[-1]["datetime"] - run[0]["datetime"] >= timedelta(minutes=min_minutes - 1):
+            lo, hi = run[0]["datetime"], run[-1]["datetime"]
+            runs.append([p for p in points if lo <= p["datetime"] <= hi])
+    return runs
+
+
+def _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=0):
+    device = cfg["device"]
+    fit_bytes = build_monitoring_fit(
+        points=seg,
+        manufacturer=device["manufacturer"],
+        product_id=device["product_id"],
+        serial_number=device["serial_number"],
+        software_version=device.get("software_version", 331),
+        utc_offset_seconds=utc_offset_seconds,
+        time_created_offset=time_created_offset,
+    )
+    return garmin.upload_fit_for_window(fit_bytes, seg[0]["datetime"])
+
+
 def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state: StateStore):
-    """Execute one full sync cycle."""
+    """
+    Execute one full sync cycle.
+
+    New data (after the watermark) is uploaded as before. Older minutes that Garmin is
+    missing (e.g. wiped by a later sync from the real watch, or rejected) are re-sent
+    as backfill, at most `backfill_max_attempts` times per run.
+    """
     log.info("=== Fitbit2Garmin cycle starting ===")
 
-    lookback = cfg["sync"].get("lookback_hours", 4)
-    recency_minutes = cfg["sync"].get("recency_minutes", 60)
-    device = cfg["device"]
+    sync_cfg = cfg["sync"]
+    lookback = sync_cfg.get("lookback_hours", 4)
+    backfill_hours = sync_cfg.get("backfill_hours", 48)
+    backfill_min_minutes = sync_cfg.get("backfill_min_minutes", 10)
+    backfill_max_attempts = sync_cfg.get("backfill_max_attempts", 3)
+    recency_minutes = sync_cfg.get("recency_minutes", 60)
 
-    # 1. Pull Google Health data
+    # 1. Pull Google Health data. Fetching the backfill window as well means data
+    #    that reached Google Health late (tracker synced hours later) is still seen.
     health.ensure_authorized()
-    points, utc_offset_seconds = health.get_combined_intraday(lookback_hours=lookback)
+    points, utc_offset_seconds = health.get_combined_intraday(lookback_hours=max(lookback, backfill_hours))
 
     if not points:
-        log.warning("No Google Health data returned for the last %dh — skipping.", lookback)
+        log.warning("No Google Health data returned for the last %dh — skipping.", max(lookback, backfill_hours))
         return
 
     # 2. Apply recency buffer: hold back data newer than recency_minutes.
@@ -129,61 +178,55 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
         log.info("All Google Health data is within the recency buffer — nothing to upload yet.")
         return
 
-    # 3. Drop points we already uploaded (StateStore watermark).
-    #    Acts as fallback deduplication when the wellness API is unavailable.
+    # 3. Skip any minute already populated on Garmin (from any source —
+    #    real device or a previous fitbit2garmin upload).
+    points = garmin.filter_covered_points(points, utc_offset_seconds=utc_offset_seconds)
+
+    # 4. Split what's left into new data (after the watermark) and backfill.
     last_uploaded = state.load_last_uploaded()
-    if last_uploaded is not None:
-        before = len(points)
-        points = [p for p in points if p["datetime"] > last_uploaded]
-        log.info(
-            "Skipping %d already-uploaded point(s) (last uploaded: %s).",
-            before - len(points),
-            last_uploaded.strftime("%H:%M:%S UTC"),
-        )
+    new_points = [p for p in points if last_uploaded is None or p["datetime"] > last_uploaded]
+    old_points = [p for p in points if last_uploaded is not None and p["datetime"] <= last_uploaded]
 
-    if not points:
-        log.info("No new Google Health data since last upload — nothing to do.")
-        return
-
-    # 4. Skip any minute already populated on Garmin (from any source —
-    #    real device or a previous fitbit2garmin upload).  This prevents overwriting
-    #    data that beat us to Garmin, while the recency buffer makes it likely
-    #    that real-device data arrived first for recent minutes.
-    points = garmin.filter_covered_points(points)
-
-    if not points:
-        log.info("All candidate points are already covered on Garmin — nothing to upload.")
-        return
-
-    # 5. Split into contiguous segments
-    segments = split_segments(points)
-    log.info("%d contiguous segment(s) to upload.", len(segments))
-
-    # 6. Build + upload one FIT file per segment
+    # 5. New data: one FIT file per contiguous segment, advancing the watermark after each.
+    segments = split_segments(new_points)
+    log.info("%d new segment(s) to upload.", len(segments))
     for i, seg in enumerate(segments, 1):
-        window_start = seg[0]["datetime"]
-        window_end = seg[-1]["datetime"]
         log.info(
             "Segment %d/%d: %s–%s (%d points)",
-            i, len(segments),
-            window_start.strftime("%H:%M"),
-            window_end.strftime("%H:%M"),
-            len(seg),
+            i, len(segments), seg[0]["datetime"].strftime("%H:%M"), seg[-1]["datetime"].strftime("%H:%M"), len(seg),
         )
-        fit_bytes = build_monitoring_fit(
-            points=seg,
-            manufacturer=device["manufacturer"],
-            product_id=device["product_id"],
-            serial_number=device["serial_number"],
-            software_version=device.get("software_version", 331),
-            utc_offset_seconds=utc_offset_seconds,
-        )
-        result = garmin.upload_fit_for_window(fit_bytes, window_start)
+        result = _upload_segment(cfg, garmin, seg, utc_offset_seconds)
         log.info("Upload complete: %s", result)
-        # 7. Advance the watermark immediately after each successful upload so
-        #    that if a later segment fails, already-uploaded segments are skipped
-        #    by the watermark on the next cycle (not just by the coverage check).
-        state.save_last_uploaded(window_end)
+        state.save_last_uploaded(seg[-1]["datetime"])
+
+    # 6. Backfill: minutes uploaded before but missing on Garmin now.
+    backfill_cutoff = datetime.now(timezone.utc) - timedelta(hours=backfill_hours)
+    attempts = {
+        k: v for k, v in state.load_backfill_attempts().items()
+        if datetime.fromisoformat(k) >= backfill_cutoff
+    }
+    runs = select_backfill_runs(old_points, min_minutes=backfill_min_minutes)
+    if runs:
+        log.info("%d backfill run(s): minutes uploaded earlier that Garmin no longer has.", len(runs))
+    for run in runs:
+        for seg in split_segments(run):
+            key = seg[0]["datetime"].isoformat()
+            tries = attempts.get(key, 0)
+            label = f"{seg[0]['datetime']:%m-%d %H:%M}–{seg[-1]['datetime']:%H:%M} ({len(seg)} points)"
+            if tries >= backfill_max_attempts:
+                log.info("Backfill %s: gave up after %d attempt(s).", label, tries)
+                continue
+            # Steps were sent the first time; only re-send them if Garmin has none here.
+            if garmin.steps_in_range(seg[0]["datetime"], seg[-1]["datetime"], utc_offset_seconds) > 0:
+                seg = [{**p, "steps_delta": 0, "cumulative_steps": 0} for p in seg]
+            log.info("Backfill %s, attempt %d.", label, tries + 1)
+            # Shift time_created a few seconds earlier per attempt so Garmin doesn't
+            # reject it as a duplicate of the original upload.
+            attempts[key] = tries + 1
+            state.save_backfill_attempts(attempts)
+            result = _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=tries + 1)
+            log.info("Backfill upload complete: %s", result)
+    state.save_backfill_attempts(attempts)
 
     log.info("=== Fitbit2Garmin cycle done ===")
 

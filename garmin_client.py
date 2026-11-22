@@ -8,7 +8,7 @@ import io
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from garminconnect import Garmin
 
@@ -77,29 +77,58 @@ class GarminClient:
             )
             return set()
 
-    def filter_covered_points(self, points: list[dict]) -> list[dict]:
+    def filter_covered_points(
+        self, points: list[dict], utc_offset_seconds: int = 0, tolerance_minutes: int = 2
+    ) -> list[dict]:
         """
         Remove any points whose minute already has HR data on Garmin Connect.
+
+        Garmin reports heart rate about every 2 minutes, so a minute counts as covered
+        when Garmin has a sample within `tolerance_minutes` of it. Garmin's daily heart
+        rate is per local date, so dates are taken in the user's UTC offset.
         """
         if not points:
             return []
 
-        dates_needed = {p["datetime"].strftime("%Y-%m-%d") for p in points}
+        offset = timedelta(seconds=utc_offset_seconds)
+        dates_needed = {(p["datetime"] + offset).strftime("%Y-%m-%d") for p in points}
         covered: set[datetime] = set()
-        for date in dates_needed:
+        for date in sorted(dates_needed):
             covered |= self.get_covered_minutes(date)
 
         if not covered:
             return points
 
-        filtered = [
-            p for p in points
-            if p["datetime"].replace(second=0, microsecond=0) not in covered
-        ]
+        def is_covered(dt: datetime) -> bool:
+            m = dt.replace(second=0, microsecond=0)
+            return any(m + timedelta(minutes=k) in covered
+                       for k in range(-tolerance_minutes, tolerance_minutes + 1))
+
+        filtered = [p for p in points if not is_covered(p["datetime"])]
         removed = len(points) - len(filtered)
         if removed:
             log.info("Skipping %d point(s) already present on Garmin Connect.", removed)
         return filtered
+
+    def steps_in_range(self, start: datetime, end: datetime, utc_offset_seconds: int = 0) -> int:
+        """
+        Steps Garmin already has in the 15-minute buckets overlapping [start, end].
+        On error, returns 1 so callers assume steps exist and don't send them twice.
+        """
+        self._ensure_connected()
+        offset = timedelta(seconds=utc_offset_seconds)
+        dates = {(start + offset).strftime("%Y-%m-%d"), (end + offset).strftime("%Y-%m-%d")}
+        total = 0
+        try:
+            for date in sorted(dates):
+                for b in self._client.get_steps_data(date) or []:
+                    b_start = datetime.fromisoformat(b["startGMT"]).replace(tzinfo=timezone.utc)
+                    if start - timedelta(minutes=15) < b_start <= end:
+                        total += b.get("steps") or 0
+        except Exception as e:
+            log.warning("Could not fetch Garmin steps for %s–%s (%s) — assuming present.", start, end, e)
+            return 1
+        return total
 
     # ------------------------------------------------------------------
     # Upload
@@ -127,6 +156,8 @@ class GarminClient:
                 # Use the same endpoint as garth did
                 resp = self._client.client.post("connectapi", "/upload-service/upload", files=files, api=True)
                 log.info("Garmin upload response: %s", resp)
+                if "contained no content" in str(resp):
+                    log.warning("Garmin stored nothing from %s (\"contained no content\").", filename)
                 return resp
             except Exception as e:
                 if str(e).startswith("API Error 409") or "Duplicate Wellness File" in str(e):
