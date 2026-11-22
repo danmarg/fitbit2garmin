@@ -51,10 +51,11 @@ class GarminClient:
     # Covered-minute check
     # ------------------------------------------------------------------
 
-    def get_covered_minutes(self, date: str) -> set[datetime]:
+    def get_covered_minutes(self, date: str) -> set[datetime] | None:
         """
         Return the set of UTC minute-datetimes that already have HR data on
-        Garmin Connect for the given date (YYYY-MM-DD).
+        Garmin Connect for the given local date (YYYY-MM-DD), or None if the
+        wellness API could not be read.
         """
         self._ensure_connected()
         try:
@@ -70,41 +71,42 @@ class GarminClient:
             log.info("Garmin already has %d covered minute(s) for %s", len(covered), date)
             return covered
         except Exception as e:
-            log.info(
-                "Could not fetch existing Garmin HR data for %s "
-                "(wellness API unavailable, skipping coverage check): %s",
-                date, e,
-            )
-            return set()
+            log.warning("Could not fetch existing Garmin HR data for %s: %s", date, e)
+            return None
+
+    def get_coverage(self, points: list[dict], utc_offset_seconds: int = 0) -> set[datetime] | None:
+        """
+        Minutes with HR on Garmin for every local date the points touch, or None if
+        any date could not be read. Garmin's daily heart rate is per local date.
+        """
+        offset = timedelta(seconds=utc_offset_seconds)
+        covered: set[datetime] = set()
+        for date in sorted({(p["datetime"] + offset).strftime("%Y-%m-%d") for p in points}):
+            day = self.get_covered_minutes(date)
+            if day is None:
+                return None
+            covered |= day
+        return covered
+
+    @staticmethod
+    def is_covered(dt: datetime, covered: set[datetime], tolerance_minutes: int = 0) -> bool:
+        m = dt.replace(second=0, microsecond=0)
+        return any(m + timedelta(minutes=k) in covered
+                   for k in range(-tolerance_minutes, tolerance_minutes + 1))
 
     def filter_covered_points(
-        self, points: list[dict], utc_offset_seconds: int = 0, tolerance_minutes: int = 2
+        self, points: list[dict], utc_offset_seconds: int = 0, tolerance_minutes: int = 0
     ) -> list[dict]:
         """
-        Remove any points whose minute already has HR data on Garmin Connect.
-
-        Garmin reports heart rate about every 2 minutes, so a minute counts as covered
-        when Garmin has a sample within `tolerance_minutes` of it. Garmin's daily heart
-        rate is per local date, so dates are taken in the user's UTC offset.
+        Remove points whose minute already has HR on Garmin Connect (within
+        `tolerance_minutes`). If Garmin can't be read, all points pass through.
         """
         if not points:
             return []
-
-        offset = timedelta(seconds=utc_offset_seconds)
-        dates_needed = {(p["datetime"] + offset).strftime("%Y-%m-%d") for p in points}
-        covered: set[datetime] = set()
-        for date in sorted(dates_needed):
-            covered |= self.get_covered_minutes(date)
-
+        covered = self.get_coverage(points, utc_offset_seconds)
         if not covered:
             return points
-
-        def is_covered(dt: datetime) -> bool:
-            m = dt.replace(second=0, microsecond=0)
-            return any(m + timedelta(minutes=k) in covered
-                       for k in range(-tolerance_minutes, tolerance_minutes + 1))
-
-        filtered = [p for p in points if not is_covered(p["datetime"])]
+        filtered = [p for p in points if not self.is_covered(p["datetime"], covered, tolerance_minutes)]
         removed = len(points) - len(filtered)
         if removed:
             log.info("Skipping %d point(s) already present on Garmin Connect.", removed)

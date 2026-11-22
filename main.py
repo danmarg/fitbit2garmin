@@ -178,14 +178,25 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
         log.info("All Google Health data is within the recency buffer — nothing to upload yet.")
         return
 
-    # 3. Skip any minute already populated on Garmin (from any source —
-    #    real device or a previous fitbit2garmin upload).
-    points = garmin.filter_covered_points(points, utc_offset_seconds=utc_offset_seconds)
-
-    # 4. Split what's left into new data (after the watermark) and backfill.
+    # 3. Split into new data (after the watermark) and already-uploaded data, and drop
+    #    minutes Garmin already has (from any source — real device or a previous upload).
+    #    New data matches Garmin's samples exactly; Garmin's sample at the end of the
+    #    previous upload would otherwise hide the first new minutes. Backfill allows
+    #    +-2 min because Garmin reports heart rate about every 2 minutes.
     last_uploaded = state.load_last_uploaded()
+    coverage = garmin.get_coverage(points, utc_offset_seconds)
     new_points = [p for p in points if last_uploaded is None or p["datetime"] > last_uploaded]
     old_points = [p for p in points if last_uploaded is not None and p["datetime"] <= last_uploaded]
+    if coverage is None:
+        # Without Garmin's view every old minute would look missing; never backfill blind.
+        log.warning("Garmin coverage unavailable — uploading new data only, no backfill this cycle.")
+        old_points = []
+    else:
+        before = len(new_points)
+        new_points = [p for p in new_points if not garmin.is_covered(p["datetime"], coverage)]
+        if before - len(new_points):
+            log.info("Skipping %d new point(s) already present on Garmin Connect.", before - len(new_points))
+        old_points = [p for p in old_points if not garmin.is_covered(p["datetime"], coverage, 2)]
 
     # 5. New data: one FIT file per contiguous segment, advancing the watermark after each.
     segments = split_segments(new_points)

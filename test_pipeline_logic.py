@@ -288,7 +288,7 @@ class TestFilterCoveredPoints(unittest.TestCase):
         covered = {base + timedelta(minutes=1), base + timedelta(minutes=3)}
         with patch.object(self.client, "get_covered_minutes", return_value=covered):
             pts = self._pts(range(5))
-            result = self.client.filter_covered_points(pts, tolerance_minutes=0)
+            result = self.client.filter_covered_points(pts)
             result_times = {p["datetime"] for p in result}
             self.assertNotIn(base + timedelta(minutes=1), result_times)
             self.assertNotIn(base + timedelta(minutes=3), result_times)
@@ -316,7 +316,7 @@ class TestFilterCoveredPoints(unittest.TestCase):
         base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
         covered = {base, base + timedelta(minutes=4)}
         with patch.object(self.client, "get_covered_minutes", return_value=covered):
-            result = self.client.filter_covered_points(self._pts(range(10)))
+            result = self.client.filter_covered_points(self._pts(range(10)), tolerance_minutes=2)
         self.assertEqual([p["datetime"] for p in result], [base + timedelta(minutes=m) for m in (7, 8, 9)])
 
     def test_dates_are_local(self):
@@ -376,8 +376,10 @@ class TestRunSyncBackfill(unittest.TestCase):
         self.state.save_last_uploaded(now - timedelta(hours=4))
         self.health = MagicMock()
         self.health.get_combined_intraday.return_value = (self.points, 3600)
+        from garmin_client import GarminClient
         self.garmin = MagicMock()
-        self.garmin.filter_covered_points.side_effect = lambda pts, **kw: pts
+        self.garmin.get_coverage.return_value = set()
+        self.garmin.is_covered.side_effect = GarminClient.is_covered
         self.garmin.steps_in_range.return_value = 0
         self.uploaded = []
         self.main.build_monitoring_fit = self._capture
@@ -418,6 +420,18 @@ class TestRunSyncBackfill(unittest.TestCase):
         self.uploaded.clear()
         self._run()
         self.assertEqual(self.uploaded, [])
+
+    def test_no_backfill_when_garmin_coverage_fails(self):
+        self.garmin.get_coverage.return_value = None
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)  # new data only
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
+
+    def test_new_data_right_after_a_garmin_sample_is_kept(self):
+        # Garmin's last sample of the previous upload must not hide the next minutes.
+        self.garmin.get_coverage.return_value = {self.new_start - timedelta(minutes=1)}
+        self._run()
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
 
     def test_short_holes_are_not_backfilled(self):
         self.health.get_combined_intraday.return_value = (self.points[:5] + self.points[30:], 3600)
