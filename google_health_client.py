@@ -307,6 +307,8 @@ class GoogleHealthClient:
                     "heart_rate": heart_rate,
                     "steps_delta": steps_delta,
                     "cumulative_steps": cumulative_steps,
+                    # This minute's own UTC offset, so data across a DST change is local-correct.
+                    "utc_offset_seconds": int(dt.astimezone(local_tz).utcoffset().total_seconds()),
                 }
             )
 

@@ -25,6 +25,10 @@ sync:
   lookback_hours: 4     # How many hours back to pull from Google Health
   recency_minutes: 60   # Don't upload data newer than this many minutes;
                         # gives the real Garmin device time to sync first
+  backfill_hours: 48    # Re-send minutes from this window that Garmin is missing
+                        # (e.g. wiped by a later sync from the real watch)
+  backfill_min_minutes: 10   # only backfill gaps at least this long
+  backfill_max_attempts: 3   # per gap, then give up
   hooks:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"

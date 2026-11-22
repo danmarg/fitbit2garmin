@@ -311,6 +311,202 @@ class TestFilterCoveredPoints(unittest.TestCase):
             self.assertEqual(called_dates, {"2026-03-11", "2026-03-12"})
 
 
+    def test_minute_near_a_garmin_sample_is_covered(self):
+        # Garmin samples every 2 minutes; minutes 0..4 around samples at 0 and 4 are all covered.
+        base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
+        covered = {base, base + timedelta(minutes=4)}
+        with patch.object(self.client, "get_covered_minutes", return_value=covered):
+            result = self.client.filter_covered_points(self._pts(range(10)), tolerance_minutes=2)
+        self.assertEqual([p["datetime"] for p in result], [base + timedelta(minutes=m) for m in (7, 8, 9)])
+
+    def test_dates_are_local(self):
+        # 23:30 UTC is already the next day in UTC+1.
+        pts = [{"datetime": datetime(2026, 3, 11, 23, 30, tzinfo=timezone.utc)}]
+        with patch.object(self.client, "get_covered_minutes", return_value=set()) as gcm:
+            self.client.filter_covered_points(pts, utc_offset_seconds=3600)
+        self.assertEqual([c.args[0] for c in gcm.call_args_list], ["2026-03-12"])
+
+
+@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+class TestZeroStepSegment(unittest.TestCase):
+    """Garmin stores nothing from a file whose cycles stay at zero."""
+
+    def _cycles(self, pts):
+        msgs = fitparse.FitFile(io.BytesIO(build_monitoring_fit(pts, 1, 3993, 1))).get_messages("monitoring")
+        return [(m.get("cycles").raw_value, m.get_value("activity_type")) for m in msgs if m.get("cycles")]
+
+    def test_zero_step_segment_gets_one_walking_cycle(self):
+        base = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
+        pts = [{"datetime": base + timedelta(minutes=i), "heart_rate": 55, "steps_delta": 0, "cumulative_steps": 0}
+               for i in range(3)]
+        cycles = self._cycles(pts)
+        self.assertEqual([c for c, _ in cycles], [1, 1, 1])
+        self.assertEqual(cycles[0][1], "walking")
+
+    def test_segment_with_steps_is_unchanged(self):
+        base = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
+        pts = [{"datetime": base, "heart_rate": 55, "steps_delta": 0, "cumulative_steps": 100},
+               {"datetime": base + timedelta(minutes=1), "heart_rate": 56, "steps_delta": 4, "cumulative_steps": 104}]
+        self.assertEqual([c for c, _ in self._cycles(pts)], [0, 4])
+
+    def test_cycles_do_not_reset_at_local_midnight(self):
+        base = datetime(2026, 3, 10, 22, 58, tzinfo=timezone.utc)
+        # cumulative_steps (since local midnight) resets between the 2nd and 3rd minute.
+        pts = [{"datetime": base, "heart_rate": 55, "steps_delta": 3, "cumulative_steps": 900},
+               {"datetime": base + timedelta(minutes=1), "heart_rate": 55, "steps_delta": 2, "cumulative_steps": 902},
+               {"datetime": base + timedelta(minutes=2), "heart_rate": 55, "steps_delta": 4, "cumulative_steps": 4}]
+        self.assertEqual([c for c, _ in self._cycles(pts)], [3, 5, 9])
+
+    def test_time_created_offset(self):
+        base = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
+        pts = [{"datetime": base, "heart_rate": 55, "steps_delta": 0, "cumulative_steps": 0}]
+        fit_bytes = build_monitoring_fit(pts, 1, 3993, 1, time_created_offset=2)
+        file_id = next(fitparse.FitFile(io.BytesIO(fit_bytes)).get_messages("file_id"))
+        self.assertEqual(file_id.get_value("time_created").replace(tzinfo=timezone.utc), base - timedelta(seconds=2))
+
+
+class TestRunSyncBackfill(unittest.TestCase):
+    def setUp(self):
+        import main
+        self.main = main
+        self.tmp = tempfile.mkdtemp()
+        self.state = main.StateStore(os.path.join(self.tmp, "state.json"))
+        self.cfg = {"sync": {"recency_minutes": 60, "backfill_hours": 48},
+                    "device": {"manufacturer": 1, "product_id": 3993, "serial_number": 1}}
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self.old_start = now - timedelta(hours=6)
+        # 30 old minutes (before the watermark) and 10 new ones (after it, outside recency).
+        self.points = [{"datetime": self.old_start + timedelta(minutes=i), "heart_rate": 60,
+                        "steps_delta": 2, "cumulative_steps": 2 * (i + 1)} for i in range(30)]
+        self.new_start = now - timedelta(hours=3)
+        self.points += [{"datetime": self.new_start + timedelta(minutes=i), "heart_rate": 70,
+                         "steps_delta": 0, "cumulative_steps": 60} for i in range(10)]
+        self.state.save_last_uploaded(now - timedelta(hours=4))
+        self.health = MagicMock()
+        self.health.get_combined_intraday.return_value = (self.points, 3600)
+        from garmin_client import GarminClient
+        self.garmin = MagicMock()
+        # One Garmin sample on each date, far from every point, so no date counts as empty.
+        far = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.garmin.get_coverage_by_date.side_effect = lambda pts, off: {
+            GarminClient.local_date(p, off): {far} for p in pts
+        }
+        self.garmin.is_covered.side_effect = GarminClient.is_covered
+        self.garmin.local_date.side_effect = GarminClient.local_date
+        self.garmin.steps_in_range.return_value = 0
+        self.uploaded = []
+        self.main.build_monitoring_fit = self._capture
+
+    def tearDown(self):
+        from fit_engine import build_monitoring_fit
+        self.main.build_monitoring_fit = build_monitoring_fit
+
+    def _capture(self, points, **kw):
+        self.uploaded.append((points, kw.get("time_created_offset", 0)))
+        return b"fit"
+
+    def _run(self):
+        self.main.run_sync(self.cfg, self.health, self.garmin, self.state)
+
+    def test_new_then_backfill(self):
+        self._run()
+        self.assertEqual(len(self.uploaded), 2)
+        new, backfill = self.uploaded
+        self.assertEqual(new[0][0]["datetime"], self.new_start)
+        self.assertEqual(new[1], 0)
+        self.assertEqual(backfill[0][0]["datetime"], self.old_start)
+        self.assertEqual(backfill[1], 1)  # time_created shifted off the original upload
+        self.assertEqual(sum(p["steps_delta"] for p in backfill[0]), 60)  # Garmin had no steps there
+        self.assertEqual(self.state.load_last_uploaded(), self.new_start + timedelta(minutes=9))
+
+    def test_backfill_strips_steps_garmin_already_has(self):
+        self.garmin.steps_in_range.return_value = 25
+        self._run()
+        self.assertEqual(sum(p["steps_delta"] for p in self.uploaded[1][0]), 0)
+
+    def test_backfill_gives_up_after_max_attempts(self):
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)  # backfill only
+        for expected_offset in (1, 2, 3):
+            self.uploaded.clear()
+            self._run()
+            self.assertEqual([off for _, off in self.uploaded], [expected_offset])
+        self.uploaded.clear()
+        self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_no_backfill_when_garmin_coverage_fails(self):
+        self.garmin.get_coverage_by_date.side_effect = None
+        self.garmin.get_coverage_by_date.return_value = None
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)  # new data only
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
+
+    def _coverage(self, minutes):
+        from garmin_client import GarminClient
+        self.garmin.get_coverage_by_date.side_effect = lambda pts, off: {
+            GarminClient.local_date(p, off): set(minutes) for p in pts
+        }
+
+    def test_no_backfill_for_a_date_garmin_returns_empty(self):
+        self._coverage([])
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)  # new data only
+
+    def test_tail_of_previous_upload_does_not_hide_new_minutes(self):
+        # Garmin's sample at the watermark is ours; the next minutes are still new.
+        watermark = self.new_start - timedelta(minutes=1)
+        self.state.save_last_uploaded(watermark)
+        self._coverage([watermark, datetime(2000, 1, 1, tzinfo=timezone.utc)])
+        self.health.get_combined_intraday.return_value = (self.points[30:], 3600)
+        self._run()
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
+
+    def test_new_minutes_between_real_watch_samples_are_skipped(self):
+        # The real watch has samples every 2 min across the new window.
+        self._coverage([self.new_start + timedelta(minutes=m) for m in range(0, 10, 2)])
+        self.health.get_combined_intraday.return_value = (self.points[30:], 3600)
+        self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_first_run_uploads_only_the_lookback_window(self):
+        os.remove(self.state.path)
+        self.cfg["sync"]["lookback_hours"] = 4
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)  # the 6h-old run is not sent
+
+    def test_attempt_cap_holds_when_the_gap_start_moves(self):
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        offsets = []
+        for drop in range(0, 4):
+            # Each cycle a little more of the gap's start has been restored on Garmin.
+            self.health.get_combined_intraday.return_value = (self.points[drop * 2:30], 3600)
+            self.uploaded.clear()
+            self._run()
+            offsets.append([off for _, off in self.uploaded])
+        self.assertEqual(offsets, [[1], [2], [3], []])
+
+    def test_corrupt_backfill_state_is_ignored(self):
+        with open(self.state.path, "w") as f:
+            json.dump({"last_uploaded_ts": (self.new_start - timedelta(hours=1)).isoformat(),
+                       "backfill_attempts": {"not-a-date": 1, self.old_start.isoformat(): "x"}}, f)
+        self._run()  # must not raise
+        self.assertEqual(len(self.uploaded), 2)
+
+    def test_segment_uses_its_own_utc_offset(self):
+        seen = []
+        self.main.build_monitoring_fit = lambda points, **kw: seen.append(kw["utc_offset_seconds"]) or b"fit"
+        for p in self.points[:30]:
+            p["utc_offset_seconds"] = 7200  # before a DST change
+        self._run()
+        self.assertEqual(sorted(seen), [3600, 7200])
+
+    def test_short_holes_are_not_backfilled(self):
+        self.health.get_combined_intraday.return_value = (self.points[:5] + self.points[30:], 3600)
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)  # only the new segment
+
+
 class TestUploadDuplicate(unittest.TestCase):
     """A 409 'Duplicate Wellness File' means Garmin already has the data."""
 
