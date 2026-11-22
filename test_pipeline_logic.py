@@ -349,6 +349,14 @@ class TestZeroStepSegment(unittest.TestCase):
                {"datetime": base + timedelta(minutes=1), "heart_rate": 56, "steps_delta": 4, "cumulative_steps": 104}]
         self.assertEqual([c for c, _ in self._cycles(pts)], [0, 4])
 
+    def test_cycles_do_not_reset_at_local_midnight(self):
+        base = datetime(2026, 3, 10, 22, 58, tzinfo=timezone.utc)
+        # cumulative_steps (since local midnight) resets between the 2nd and 3rd minute.
+        pts = [{"datetime": base, "heart_rate": 55, "steps_delta": 3, "cumulative_steps": 900},
+               {"datetime": base + timedelta(minutes=1), "heart_rate": 55, "steps_delta": 2, "cumulative_steps": 902},
+               {"datetime": base + timedelta(minutes=2), "heart_rate": 55, "steps_delta": 4, "cumulative_steps": 4}]
+        self.assertEqual([c for c, _ in self._cycles(pts)], [3, 5, 9])
+
     def test_time_created_offset(self):
         base = datetime(2026, 3, 10, 2, 0, tzinfo=timezone.utc)
         pts = [{"datetime": base, "heart_rate": 55, "steps_delta": 0, "cumulative_steps": 0}]
@@ -378,8 +386,13 @@ class TestRunSyncBackfill(unittest.TestCase):
         self.health.get_combined_intraday.return_value = (self.points, 3600)
         from garmin_client import GarminClient
         self.garmin = MagicMock()
-        self.garmin.get_coverage.return_value = set()
+        # One Garmin sample on each date, far from every point, so no date counts as empty.
+        far = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        self.garmin.get_coverage_by_date.side_effect = lambda pts, off: {
+            GarminClient.local_date(p, off): {far} for p in pts
+        }
         self.garmin.is_covered.side_effect = GarminClient.is_covered
+        self.garmin.local_date.side_effect = GarminClient.local_date
         self.garmin.steps_in_range.return_value = 0
         self.uploaded = []
         self.main.build_monitoring_fit = self._capture
@@ -422,16 +435,71 @@ class TestRunSyncBackfill(unittest.TestCase):
         self.assertEqual(self.uploaded, [])
 
     def test_no_backfill_when_garmin_coverage_fails(self):
-        self.garmin.get_coverage.return_value = None
+        self.garmin.get_coverage_by_date.side_effect = None
+        self.garmin.get_coverage_by_date.return_value = None
         self._run()
         self.assertEqual(len(self.uploaded), 1)  # new data only
         self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
 
-    def test_new_data_right_after_a_garmin_sample_is_kept(self):
-        # Garmin's last sample of the previous upload must not hide the next minutes.
-        self.garmin.get_coverage.return_value = {self.new_start - timedelta(minutes=1)}
+    def _coverage(self, minutes):
+        from garmin_client import GarminClient
+        self.garmin.get_coverage_by_date.side_effect = lambda pts, off: {
+            GarminClient.local_date(p, off): set(minutes) for p in pts
+        }
+
+    def test_no_backfill_for_a_date_garmin_returns_empty(self):
+        self._coverage([])
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)  # new data only
+
+    def test_tail_of_previous_upload_does_not_hide_new_minutes(self):
+        # Garmin's sample at the watermark is ours; the next minutes are still new.
+        watermark = self.new_start - timedelta(minutes=1)
+        self.state.save_last_uploaded(watermark)
+        self._coverage([watermark, datetime(2000, 1, 1, tzinfo=timezone.utc)])
+        self.health.get_combined_intraday.return_value = (self.points[30:], 3600)
         self._run()
         self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)
+
+    def test_new_minutes_between_real_watch_samples_are_skipped(self):
+        # The real watch has samples every 2 min across the new window.
+        self._coverage([self.new_start + timedelta(minutes=m) for m in range(0, 10, 2)])
+        self.health.get_combined_intraday.return_value = (self.points[30:], 3600)
+        self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_first_run_uploads_only_the_lookback_window(self):
+        os.remove(self.state.path)
+        self.cfg["sync"]["lookback_hours"] = 4
+        self._run()
+        self.assertEqual(len(self.uploaded), 1)
+        self.assertEqual(self.uploaded[0][0][0]["datetime"], self.new_start)  # the 6h-old run is not sent
+
+    def test_attempt_cap_holds_when_the_gap_start_moves(self):
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        offsets = []
+        for drop in range(0, 4):
+            # Each cycle a little more of the gap's start has been restored on Garmin.
+            self.health.get_combined_intraday.return_value = (self.points[drop * 2:30], 3600)
+            self.uploaded.clear()
+            self._run()
+            offsets.append([off for _, off in self.uploaded])
+        self.assertEqual(offsets, [[1], [2], [3], []])
+
+    def test_corrupt_backfill_state_is_ignored(self):
+        with open(self.state.path, "w") as f:
+            json.dump({"last_uploaded_ts": (self.new_start - timedelta(hours=1)).isoformat(),
+                       "backfill_attempts": {"not-a-date": 1, self.old_start.isoformat(): "x"}}, f)
+        self._run()  # must not raise
+        self.assertEqual(len(self.uploaded), 2)
+
+    def test_segment_uses_its_own_utc_offset(self):
+        seen = []
+        self.main.build_monitoring_fit = lambda points, **kw: seen.append(kw["utc_offset_seconds"]) or b"fit"
+        for p in self.points[:30]:
+            p["utc_offset_seconds"] = 7200  # before a DST change
+        self._run()
+        self.assertEqual(sorted(seen), [3600, 7200])
 
     def test_short_holes_are_not_backfilled(self):
         self.health.get_combined_intraday.return_value = (self.points[:5] + self.points[30:], 3600)

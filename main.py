@@ -60,12 +60,26 @@ class StateStore:
     def save_last_uploaded(self, dt: datetime):
         self._store("last_uploaded_ts", dt.isoformat())
 
-    def load_backfill_attempts(self) -> dict[str, int]:
+    def load_backfill_attempts(self) -> dict[datetime, int]:
+        """{UTC minute: attempts}. Entries that don't parse are ignored, never fatal."""
         raw = self._load().get("backfill_attempts")
-        return dict(raw) if isinstance(raw, dict) else {}
+        out: dict[datetime, int] = {}
+        if not isinstance(raw, dict):
+            return out
+        for k, v in raw.items():
+            try:
+                dt = datetime.fromisoformat(k)
+            except (TypeError, ValueError):
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if isinstance(v, int) and not isinstance(v, bool):
+                out[dt] = v
+        return out
 
-    def save_backfill_attempts(self, attempts: dict[str, int]):
-        self._store("backfill_attempts", attempts)
+    def save_backfill_attempts(self, attempts: dict[datetime, int]):
+        self._store("backfill_attempts", {k.isoformat(): v for k, v in sorted(attempts.items())})
+
 
 
 def load_config(path: str) -> dict:
@@ -125,6 +139,8 @@ def select_backfill_runs(points: list[dict], min_minutes: int = 10) -> list[list
 
 
 def _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=0):
+    """Build and upload one segment; its own UTC offset wins over the current one."""
+    utc_offset_seconds = seg[0].get("utc_offset_seconds", utc_offset_seconds)
     device = cfg["device"]
     fit_bytes = build_monitoring_fit(
         points=seg,
@@ -180,25 +196,43 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
 
     # 3. Split into new data (after the watermark) and already-uploaded data, and drop
     #    minutes Garmin already has (from any source — real device or a previous upload).
-    #    New data matches Garmin's samples exactly; Garmin's sample at the end of the
-    #    previous upload would otherwise hide the first new minutes. Backfill allows
-    #    +-2 min because Garmin reports heart rate about every 2 minutes.
+    #    Garmin reports heart rate about every 2 minutes, so a minute counts as covered
+    #    when a Garmin sample is within 2 minutes of it.
+    now = datetime.now(timezone.utc)
     last_uploaded = state.load_last_uploaded()
-    coverage = garmin.get_coverage(points, utc_offset_seconds)
+    if last_uploaded is None:
+        # First run: don't treat the whole backfill window as new data.
+        first_cutoff = now - timedelta(hours=lookback)
+        points = [p for p in points if p["datetime"] >= first_cutoff]
     new_points = [p for p in points if last_uploaded is None or p["datetime"] > last_uploaded]
     old_points = [p for p in points if last_uploaded is not None and p["datetime"] <= last_uploaded]
-    if coverage is None:
+
+    by_date = garmin.get_coverage_by_date(points, utc_offset_seconds)
+    if by_date is None:
         # Without Garmin's view every old minute would look missing; never backfill blind.
         log.warning("Garmin coverage unavailable — uploading new data only, no backfill this cycle.")
         old_points = []
     else:
+        coverage = set().union(*by_date.values()) if by_date else set()
+        # For new data, ignore Garmin samples at or before the watermark: those are the
+        # tail of our previous upload and would otherwise hide the first new minutes.
+        recent = coverage if last_uploaded is None else {m for m in coverage if m > last_uploaded}
         before = len(new_points)
-        new_points = [p for p in new_points if not garmin.is_covered(p["datetime"], coverage)]
+        new_points = [p for p in new_points if not garmin.is_covered(p["datetime"], recent, 2)]
         if before - len(new_points):
             log.info("Skipping %d new point(s) already present on Garmin Connect.", before - len(new_points))
-        old_points = [p for p in old_points if not garmin.is_covered(p["datetime"], coverage, 2)]
+        # Backfill only dates where Garmin returned some heart rate: an empty day may be
+        # a bad response, and re-sending a whole day on that basis is not worth the risk.
+        empty = {d for d, mins in by_date.items() if not mins}
+        if empty:
+            log.info("Garmin has no heart rate for %s — not backfilling those date(s).", ", ".join(sorted(empty)))
+        old_points = [
+            p for p in old_points
+            if garmin.local_date(p, utc_offset_seconds) not in empty
+            and not garmin.is_covered(p["datetime"], coverage, 2)
+        ]
 
-    # 5. New data: one FIT file per contiguous segment, advancing the watermark after each.
+    # 4. New data: one FIT file per contiguous segment, advancing the watermark after each.
     segments = split_segments(new_points)
     log.info("%d new segment(s) to upload.", len(segments))
     for i, seg in enumerate(segments, 1):
@@ -210,31 +244,31 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
         log.info("Upload complete: %s", result)
         state.save_last_uploaded(seg[-1]["datetime"])
 
-    # 6. Backfill: minutes uploaded before but missing on Garmin now.
-    backfill_cutoff = datetime.now(timezone.utc) - timedelta(hours=backfill_hours)
-    attempts = {
-        k: v for k, v in state.load_backfill_attempts().items()
-        if datetime.fromisoformat(k) >= backfill_cutoff
-    }
+    # 5. Backfill: minutes uploaded before but missing on Garmin now. Attempts are
+    #    counted per minute, so a gap that shrinks or shifts keeps its count.
+    backfill_cutoff = now - timedelta(hours=backfill_hours)
+    attempts = {m: n for m, n in state.load_backfill_attempts().items() if m >= backfill_cutoff}
     runs = select_backfill_runs(old_points, min_minutes=backfill_min_minutes)
     if runs:
         log.info("%d backfill run(s): minutes uploaded earlier that Garmin no longer has.", len(runs))
     for run in runs:
-        for seg in split_segments(run):
-            key = seg[0]["datetime"].isoformat()
-            tries = attempts.get(key, 0)
+        remaining = [p for p in run if attempts.get(p["datetime"], 0) < backfill_max_attempts]
+        if len(remaining) < len(run):
+            log.info("Backfill: %d minute(s) from %s given up after %d attempt(s).",
+                     len(run) - len(remaining), f"{run[0]['datetime']:%m-%d %H:%M}", backfill_max_attempts)
+        for seg in split_segments(remaining):
+            tries = max(attempts.get(p["datetime"], 0) for p in seg)
             label = f"{seg[0]['datetime']:%m-%d %H:%M}–{seg[-1]['datetime']:%H:%M} ({len(seg)} points)"
-            if tries >= backfill_max_attempts:
-                log.info("Backfill %s: gave up after %d attempt(s).", label, tries)
-                continue
+            seg_offset = seg[0].get("utc_offset_seconds", utc_offset_seconds)
             # Steps were sent the first time; only re-send them if Garmin has none here.
-            if garmin.steps_in_range(seg[0]["datetime"], seg[-1]["datetime"], utc_offset_seconds) > 0:
+            if garmin.steps_in_range(seg[0]["datetime"], seg[-1]["datetime"], seg_offset) > 0:
                 seg = [{**p, "steps_delta": 0, "cumulative_steps": 0} for p in seg]
             log.info("Backfill %s, attempt %d.", label, tries + 1)
-            # Shift time_created a few seconds earlier per attempt so Garmin doesn't
-            # reject it as a duplicate of the original upload.
-            attempts[key] = tries + 1
+            for p in seg:
+                attempts[p["datetime"]] = attempts.get(p["datetime"], 0) + 1
             state.save_backfill_attempts(attempts)
+            # Shift time_created a few seconds earlier per attempt so Garmin doesn't
+            # reject it as a duplicate of an earlier upload starting at the same minute.
             result = _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=tries + 1)
             log.info("Backfill upload complete: %s", result)
     state.save_backfill_attempts(attempts)

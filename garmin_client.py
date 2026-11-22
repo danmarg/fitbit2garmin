@@ -74,19 +74,33 @@ class GarminClient:
             log.warning("Could not fetch existing Garmin HR data for %s: %s", date, e)
             return None
 
-    def get_coverage(self, points: list[dict], utc_offset_seconds: int = 0) -> set[datetime] | None:
+    @staticmethod
+    def local_date(point: dict, utc_offset_seconds: int = 0) -> str:
+        """The point's local calendar date, using its own offset when it carries one."""
+        offset = point.get("utc_offset_seconds", utc_offset_seconds)
+        return (point["datetime"] + timedelta(seconds=offset)).strftime("%Y-%m-%d")
+
+    def get_coverage_by_date(
+        self, points: list[dict], utc_offset_seconds: int = 0
+    ) -> dict[str, set[datetime]] | None:
         """
-        Minutes with HR on Garmin for every local date the points touch, or None if
-        any date could not be read. Garmin's daily heart rate is per local date.
+        {local date: minutes with HR on Garmin} for every local date the points touch,
+        or None if any date could not be read. Garmin's daily heart rate is per local date.
         """
-        offset = timedelta(seconds=utc_offset_seconds)
-        covered: set[datetime] = set()
-        for date in sorted({(p["datetime"] + offset).strftime("%Y-%m-%d") for p in points}):
+        by_date: dict[str, set[datetime]] = {}
+        for date in sorted({self.local_date(p, utc_offset_seconds) for p in points}):
             day = self.get_covered_minutes(date)
             if day is None:
                 return None
-            covered |= day
-        return covered
+            by_date[date] = day
+        return by_date
+
+    def get_coverage(self, points: list[dict], utc_offset_seconds: int = 0) -> set[datetime] | None:
+        """All minutes with HR on Garmin for the points' local dates, or None on error."""
+        by_date = self.get_coverage_by_date(points, utc_offset_seconds)
+        if by_date is None:
+            return None
+        return set().union(*by_date.values()) if by_date else set()
 
     @staticmethod
     def is_covered(dt: datetime, covered: set[datetime], tolerance_minutes: int = 0) -> bool:
@@ -104,7 +118,8 @@ class GarminClient:
         if not points:
             return []
         covered = self.get_coverage(points, utc_offset_seconds)
-        if not covered:
+        if covered is None:
+            log.info("Garmin coverage unavailable — not filtering.")
             return points
         filtered = [p for p in points if not self.is_covered(p["datetime"], covered, tolerance_minutes)]
         removed = len(points) - len(filtered)

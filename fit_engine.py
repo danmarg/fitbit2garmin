@@ -177,20 +177,16 @@ def _monitoring_messages(points: list[dict]) -> bytes:
     ])
     records = defn_activity + defn_hr
 
-    # Calculate segment-relative cumulative steps (reset at segment start)
-    # The first point's own steps belong to this segment, so exclude them from the offset.
-    segment_start_cumulative = (
-        points[0].get("cumulative_steps", 0) - points[0].get("steps_delta", 0) if points else 0
-    )
-
+    # Cycles are summed from each minute's steps within this segment, so they never go
+    # backwards (cumulative_steps resets at local midnight, which a segment may cross).
     no_steps = all(pt.get("steps_delta", 0) <= 0 for pt in points)
+    steps_in_segment = 0
 
     for i, pt in enumerate(points):
         ts = to_garmin_ts(pt["datetime"])
         hr = pt.get("heart_rate")  # None/0 means "no reading"; Garmin shows 0 bpm as no data
-        # Segment-relative cumulative: steps accumulated within this segment only
-        steps_cum_in_segment = pt.get("cumulative_steps", 0) - segment_start_cumulative
-        cycles = max(0, steps_cum_in_segment)
+        steps_in_segment += max(0, pt.get("steps_delta", 0))
+        cycles = steps_in_segment
         activity_type = 6 if pt.get("steps_delta", 0) > 0 else 0
         if no_steps:
             cycles = 1
