@@ -34,3 +34,11 @@ sync:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"
     # on_failure: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID/fail"
+
+sleep:
+  enabled: false        # upload Fitbit sleep to Garmin (needs the googlehealth.sleep.readonly scope)
+  holdback_hours: 3     # wait this long after waking, so a night the watch recorded is seen first
+  upload_days: 2        # upload nights that ended within this many days; raise once to backfill
+  min_minutes: 180      # ignore shorter sessions (naps)
+  calibration_days: 365 # how far back to look for watch nights to calibrate the sleep score
+  max_garmin_lookups: 40  # Garmin sleep lookups per run (the first scan spreads over several runs)

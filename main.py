@@ -16,6 +16,7 @@ import yaml
 from google_health_client import GoogleHealthClient
 from fit_engine import build_monitoring_fit
 from garmin_client import GarminClient
+from sleep_sync import SleepStore, run_sleep_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -309,13 +310,23 @@ def main():
 
     hooks = cfg.get("sync", {}).get("hooks", {})
 
+    failed = False
     try:
         run_sync(cfg, health, garmin, state)
-        run_hook(hooks.get("on_success"))
     except Exception as e:
         log.exception("Sync cycle failed: %s", e)
+        failed = True
+    # Sleep runs even if the heart-rate sync failed, and vice versa.
+    try:
+        run_sleep_sync(cfg, health, garmin, SleepStore())
+    except Exception as e:
+        log.exception("Sleep sync failed: %s", e)
+        failed = True
+
+    if failed:
         run_hook(hooks.get("on_failure"))
         sys.exit(1)
+    run_hook(hooks.get("on_success"))
 
 
 if __name__ == "__main__":

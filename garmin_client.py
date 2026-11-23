@@ -131,6 +131,25 @@ class GarminClient:
     # Upload
     # ------------------------------------------------------------------
 
+    def get_sleep_summary(self, date: str) -> dict | None:
+        """
+        Garmin's sleep for the night ending on local `date` (YYYY-MM-DD):
+        {"start", "end" (UTC datetimes), "score" (int | None), "need" (minutes | None)},
+        or None if Garmin has no sleep that night. Errors propagate to the caller.
+        """
+        self._ensure_connected()
+        data = self._client.get_sleep_data(date) or {}
+        dto = data.get("dailySleepDTO") or {}
+        if not dto.get("sleepTimeSeconds") or not dto.get("sleepStartTimestampGMT"):
+            return None
+        ts = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return {
+            "start": ts(dto["sleepStartTimestampGMT"]),
+            "end": ts(dto["sleepEndTimestampGMT"]),
+            "score": ((dto.get("sleepScores") or {}).get("overall") or {}).get("value"),
+            "need": (dto.get("sleepNeed") or {}).get("actual"),
+        }
+
     def upload_fit(self, fit_bytes: bytes, filename: str = "monitoring.fit") -> dict:
         """
         Upload a raw FIT file to Garmin Connect via the binary upload endpoint.
