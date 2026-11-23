@@ -29,6 +29,7 @@ sync:
                         # (e.g. wiped by a later sync from the real watch)
   backfill_min_minutes: 10   # only backfill gaps at least this long
   backfill_max_attempts: 3   # per gap, then give up
+  backfill_settle_minutes: 90  # don't backfill the last uploads until Garmin has had time to show them
   hooks:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"

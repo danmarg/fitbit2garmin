@@ -18,6 +18,12 @@ log = logging.getLogger(__name__)
 GARMIN_HOME = os.environ.get("STATE_DIRECTORY", os.path.expanduser("~/.garminconnect"))
 
 
+def _parse_gmt(value: str) -> datetime:
+    """Garmin's "2026-11-22T23:00:00.0" (fraction optional), as UTC; works before Python 3.11."""
+    fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in value else "%Y-%m-%dT%H:%M:%S"
+    return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+
+
 class GarminClient:
     def __init__(self, email: str, password: str):
         self.email = email
@@ -95,37 +101,11 @@ class GarminClient:
             by_date[date] = day
         return by_date
 
-    def get_coverage(self, points: list[dict], utc_offset_seconds: int = 0) -> set[datetime] | None:
-        """All minutes with HR on Garmin for the points' local dates, or None on error."""
-        by_date = self.get_coverage_by_date(points, utc_offset_seconds)
-        if by_date is None:
-            return None
-        return set().union(*by_date.values()) if by_date else set()
-
     @staticmethod
     def is_covered(dt: datetime, covered: set[datetime], tolerance_minutes: int = 0) -> bool:
         m = dt.replace(second=0, microsecond=0)
         return any(m + timedelta(minutes=k) in covered
                    for k in range(-tolerance_minutes, tolerance_minutes + 1))
-
-    def filter_covered_points(
-        self, points: list[dict], utc_offset_seconds: int = 0, tolerance_minutes: int = 0
-    ) -> list[dict]:
-        """
-        Remove points whose minute already has HR on Garmin Connect (within
-        `tolerance_minutes`). If Garmin can't be read, all points pass through.
-        """
-        if not points:
-            return []
-        covered = self.get_coverage(points, utc_offset_seconds)
-        if covered is None:
-            log.info("Garmin coverage unavailable — not filtering.")
-            return points
-        filtered = [p for p in points if not self.is_covered(p["datetime"], covered, tolerance_minutes)]
-        removed = len(points) - len(filtered)
-        if removed:
-            log.info("Skipping %d point(s) already present on Garmin Connect.", removed)
-        return filtered
 
     def steps_in_range(self, start: datetime, end: datetime, utc_offset_seconds: int = 0) -> int:
         """
@@ -139,7 +119,7 @@ class GarminClient:
         try:
             for date in sorted(dates):
                 for b in self._client.get_steps_data(date) or []:
-                    b_start = datetime.fromisoformat(b["startGMT"]).replace(tzinfo=timezone.utc)
+                    b_start = _parse_gmt(b["startGMT"])
                     if start - timedelta(minutes=15) < b_start <= end:
                         total += b.get("steps") or 0
         except Exception as e:

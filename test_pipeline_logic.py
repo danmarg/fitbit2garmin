@@ -214,6 +214,13 @@ class TestSplitSegments(unittest.TestCase):
         segs = self.split(pts)
         self.assertEqual(len(segs), 1)
 
+    def test_utc_offset_change_splits(self):
+        # Clocks go back: one FIT file can only carry one local offset.
+        pts = self._pts(range(6))
+        for i, p in enumerate(pts):
+            p["utc_offset_seconds"] = 7200 if i < 3 else 3600
+        self.assertEqual([len(s) for s in self.split(pts)], [3, 3])
+
 
 class TestStateStore(unittest.TestCase):
     """Unit tests for the StateStore watermark persistence."""
@@ -262,72 +269,48 @@ class TestStateStore(unittest.TestCase):
         self.assertTrue(os.path.exists(nested_path))
 
 
-class TestFilterCoveredPoints(unittest.TestCase):
-    """Unit tests for GarminClient.filter_covered_points (mocked API)."""
+class TestCoverage(unittest.TestCase):
+    """GarminClient.get_coverage_by_date / is_covered, as run_sync uses them (mocked API)."""
 
     def setUp(self):
         from garmin_client import GarminClient
+        self.GarminClient = GarminClient
         self.client = GarminClient.__new__(GarminClient)
         self.client._client = MagicMock()
 
-    def _pts(self, minutes, date="2026-03-11"):
-        base = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        return [{"datetime": base + timedelta(minutes=m)} for m in minutes]
-
-    def test_empty_input(self):
-        self.assertEqual(self.client.filter_covered_points([]), [])
-
-    def test_all_pass_when_nothing_covered(self):
-        with patch.object(self.client, "get_covered_minutes", return_value=set()):
-            pts = self._pts(range(5))
-            self.assertEqual(self.client.filter_covered_points(pts), pts)
-
-    def test_covered_minutes_are_removed(self):
-        # _pts uses midnight as base; covered set must use the same base
-        base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
-        covered = {base + timedelta(minutes=1), base + timedelta(minutes=3)}
-        with patch.object(self.client, "get_covered_minutes", return_value=covered):
-            pts = self._pts(range(5))
-            result = self.client.filter_covered_points(pts)
-            result_times = {p["datetime"] for p in result}
-            self.assertNotIn(base + timedelta(minutes=1), result_times)
-            self.assertNotIn(base + timedelta(minutes=3), result_times)
-            self.assertEqual(len(result), 3)
-
-    def test_all_covered_returns_empty(self):
-        base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
-        covered = {base + timedelta(minutes=i) for i in range(5)}
-        with patch.object(self.client, "get_covered_minutes", return_value=covered):
-            self.assertEqual(self.client.filter_covered_points(self._pts(range(5))), [])
-
-    def test_queries_each_date_once(self):
-        # Points spanning two dates should trigger two get_covered_minutes calls
+    def test_queries_each_local_date_once(self):
         day1 = datetime(2026, 3, 11, 23, 58, 0, tzinfo=timezone.utc)
         day2 = datetime(2026, 3, 12, 0, 2, 0, tzinfo=timezone.utc)
-        pts = [{"datetime": day1}, {"datetime": day2}]
-        with patch.object(self.client, "get_covered_minutes", return_value=set()) as mock_gcm:
-            self.client.filter_covered_points(pts)
-            called_dates = {c.args[0] for c in mock_gcm.call_args_list}
-            self.assertEqual(called_dates, {"2026-03-11", "2026-03-12"})
-
-
-    def test_minute_near_a_garmin_sample_is_covered(self):
-        # Garmin samples every 2 minutes; minutes 0..4 around samples at 0 and 4 are all covered.
-        base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
-        covered = {base, base + timedelta(minutes=4)}
-        with patch.object(self.client, "get_covered_minutes", return_value=covered):
-            result = self.client.filter_covered_points(self._pts(range(10)), tolerance_minutes=2)
-        self.assertEqual([p["datetime"] for p in result], [base + timedelta(minutes=m) for m in (7, 8, 9)])
+        with patch.object(self.client, "get_covered_minutes", return_value=set()) as gcm:
+            by_date = self.client.get_coverage_by_date([{"datetime": day1}, {"datetime": day2}])
+        self.assertEqual({c.args[0] for c in gcm.call_args_list}, {"2026-03-11", "2026-03-12"})
+        self.assertEqual(set(by_date), {"2026-03-11", "2026-03-12"})
 
     def test_dates_are_local(self):
         # 23:30 UTC is already the next day in UTC+1.
         pts = [{"datetime": datetime(2026, 3, 11, 23, 30, tzinfo=timezone.utc)}]
         with patch.object(self.client, "get_covered_minutes", return_value=set()) as gcm:
-            self.client.filter_covered_points(pts, utc_offset_seconds=3600)
+            self.client.get_coverage_by_date(pts, utc_offset_seconds=3600)
         self.assertEqual([c.args[0] for c in gcm.call_args_list], ["2026-03-12"])
 
+    def test_none_if_any_date_unreadable(self):
+        with patch.object(self.client, "get_covered_minutes", return_value=None):
+            self.assertIsNone(self.client.get_coverage_by_date([{"datetime": datetime(2026, 3, 11, tzinfo=timezone.utc)}]))
 
-@unittest.skipUnless(HAS_FITPARSE, "fitparse not installed")
+    def test_minute_near_a_garmin_sample_is_covered(self):
+        # Garmin samples every 2 minutes; minutes 0..6 around samples at 0 and 4 are covered.
+        base = datetime(2026, 3, 11, 0, 0, 0, tzinfo=timezone.utc)
+        covered = {base, base + timedelta(minutes=4)}
+        missing = [m for m in range(10) if not self.GarminClient.is_covered(base + timedelta(minutes=m), covered, 2)]
+        self.assertEqual(missing, [7, 8, 9])
+        self.assertFalse(self.GarminClient.is_covered(base + timedelta(minutes=1), covered, 0))
+
+    def test_parse_gmt(self):
+        from garmin_client import _parse_gmt
+        expected = datetime(2026, 11, 22, 23, 0, tzinfo=timezone.utc)
+        self.assertEqual((_parse_gmt("2026-11-22T23:00:00.0"), _parse_gmt("2026-11-22T23:00:00")), (expected, expected))
+
+
 class TestZeroStepSegment(unittest.TestCase):
     """Garmin stores nothing from a file whose cycles stay at zero."""
 
@@ -500,6 +483,52 @@ class TestRunSyncBackfill(unittest.TestCase):
             p["utc_offset_seconds"] = 7200  # before a DST change
         self._run()
         self.assertEqual(sorted(seen), [3600, 7200])
+
+    def test_backfill_limited_to_backfill_window_when_lookback_is_longer(self):
+        # lookback 72h > backfill 5h: the 6h-old gap is outside the backfill window, so it
+        # is never retried (its attempt count would be pruned each cycle).
+        self.cfg["sync"].update({"lookback_hours": 72, "backfill_hours": 5})
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        for _ in range(4):
+            self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_backfill_hours_zero_disables_backfill(self):
+        self.cfg["sync"]["backfill_hours"] = 0
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_recent_uploads_not_backfilled_before_they_settle(self):
+        # The watermark is just after the old run, so Garmin may not show it yet.
+        self.state.save_last_uploaded(self.old_start + timedelta(minutes=60))
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        self._run()
+        self.assertEqual(self.uploaded, [])
+
+    def test_failed_backfill_upload_does_not_stop_the_rest(self):
+        second = [{**p, "datetime": p["datetime"] - timedelta(hours=1)} for p in self.points[:30]]
+        self.health.get_combined_intraday.return_value = (second + self.points[:30], 3600)
+        calls = []
+
+        def flaky(points, **kw):
+            calls.append(points[0]["datetime"])
+            if len(calls) == 1:
+                raise RuntimeError("Garmin said no")
+            return b"fit"
+        self.main.build_monitoring_fit = flaky
+        self._run()  # must not raise
+        self.assertEqual(calls, [second[0]["datetime"], self.old_start])
+
+    def test_time_created_shift_stays_under_a_minute(self):
+        self.cfg["sync"]["backfill_max_attempts"] = 200
+        self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
+        attempts = {p["datetime"]: 58 for p in self.points[:30]}
+        self.state.save_backfill_attempts(attempts)
+        self._run()
+        self.state.save_backfill_attempts({p["datetime"]: 59 for p in self.points[:30]})
+        self._run()
+        self.assertEqual([off for _, off in self.uploaded], [59, 1])
 
     def test_short_holes_are_not_backfilled(self):
         self.health.get_combined_intraday.return_value = (self.points[:5] + self.points[30:], 3600)
