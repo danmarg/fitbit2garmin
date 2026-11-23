@@ -194,6 +194,14 @@ class TestSplitSegments(unittest.TestCase):
         self.assertEqual(len(segs), 1)
         self.assertEqual(segs[0], pts)
 
+    def test_local_midnight_splits(self):
+        # 22:50-23:09 UTC at UTC+1 crosses local midnight at 23:00 UTC.
+        base = datetime(2026, 11, 21, 22, 50, tzinfo=timezone.utc)
+        pts = [{"datetime": base + timedelta(minutes=m), "utc_offset_seconds": 3600} for m in range(20)]
+        segs = self.split(pts)
+        self.assertEqual([len(s) for s in segs], [10, 10])
+        self.assertEqual(segs[1][0]["datetime"], datetime(2026, 11, 21, 23, 0, tzinfo=timezone.utc))
+
     def test_gap_splits(self):
         # 0-4 contiguous, then a 10-minute gap, then 15-19
         pts = self._pts(list(range(5)) + list(range(15, 20)))

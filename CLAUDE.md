@@ -55,6 +55,8 @@ Google Health API (:rollUp, 60s windows, reconciled)
 Garmin behaviour found 2026-11-22 (see diagnose_hr.py on branch claude/hr-sleep-diagnostics):
 - A monitoring file whose cycles never exceed 0 is discarded ("valid type, but contained
   no content"), HR included. fit_engine adds one walking cycle to zero-step segments.
+- A monitoring file spanning local midnight is discarded the same way (found 2026-11-23);
+  split_segments splits at local date changes.
 - `device.serial_number` must be a device registered to the account (else 419 "Wellness
   device is not active"), so uploads share an identity with the user's real watch, whose
   own syncs appear to wipe previously uploaded HR. Backfill re-sends those minutes.

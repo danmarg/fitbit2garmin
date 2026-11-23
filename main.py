@@ -108,16 +108,23 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     """
     Split a list of per-minute points into contiguous segments.
     A new segment begins whenever two consecutive points are more than
-    `gap_minutes` apart (e.g. the tracker was off-wrist or data was missing), or
-    their UTC offsets differ (a DST change), since a FIT file has one local offset.
+    `gap_minutes` apart (e.g. the tracker was off-wrist or data was missing), their
+    UTC offsets differ (a DST change), since a FIT file has one local offset, or
+    they fall on different local dates: Garmin discards a monitoring file that spans
+    local midnight ("valid type, but contained no content"), HR included.
     """
+    def local_date(p):
+        return (p["datetime"] + timedelta(seconds=p.get("utc_offset_seconds", 0))).date()
+
     if not points:
         return []
     segments = []
     current = [points[0]]
     for prev, pt in zip(points, points[1:]):
         delta = pt["datetime"] - prev["datetime"]
-        if delta > timedelta(minutes=gap_minutes) or pt.get("utc_offset_seconds") != prev.get("utc_offset_seconds"):
+        if (delta > timedelta(minutes=gap_minutes)
+                or pt.get("utc_offset_seconds") != prev.get("utc_offset_seconds")
+                or local_date(pt) != local_date(prev)):
             segments.append(current)
             current = []
         current.append(pt)
