@@ -354,9 +354,21 @@ class GoogleHealthClient:
                 return out
             params["pageToken"] = body["nextPageToken"]
 
-    def get_sleeping_heart_rate(self, start: datetime, end: datetime) -> float | None:
-        """Average heart rate over a sleep session (None if there are no readings)."""
-        values = [v for v in self.parse_heart_rate(self._roll_up_minutes("heart-rate", start, end)).values() if v]
+    def get_sleeping_heart_rate(self, start: datetime, end: datetime, platform: str = "FITBIT") -> float | None:
+        """
+        Average heart rate from `platform` over a sleep session (None if no readings).
+        Raw samples, not :rollUp, which merges every source, including the Garmin
+        watch's heart rate relayed through the phone.
+        """
+        ts = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        points = self._list_points(
+            "heart-rate",
+            f'heart_rate.sample_time.physical_time >= "{ts(start)}" AND heart_rate.sample_time.physical_time < "{ts(end)}"',
+            page_size=5000,
+        )
+        values = [float((p.get("heartRate") or {}).get("beatsPerMinute") or 0) for p in points
+                  if (p.get("dataSource") or {}).get("platform") == platform]
+        values = [v for v in values if v > 0]
         return sum(values) / len(values) if values else None
 
     def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:

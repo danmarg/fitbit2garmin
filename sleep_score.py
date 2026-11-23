@@ -64,7 +64,7 @@ def stress_features(sleep_hr: float | None, hrv_ms: float | None) -> list[float]
 
 
 def _solve(a: list[list[float]], b: list[float]) -> list[float]:
-    """Gaussian elimination with partial pivoting (the systems here are 4x4)."""
+    """Gaussian elimination with partial pivoting (one row per model weight: 3 or 5)."""
     n = len(b)
     a = [row[:] for row in a]
     b = b[:]

@@ -124,9 +124,13 @@ class TestSleepSource(unittest.TestCase):
 
 
 class FakeHealth:
-    def __init__(self, sessions, hr=58.0, hrv=None, hrv_fails=False):
+    def __init__(self, sessions, hr=58.0, hrv=None, hrv_fails=False, hr_fails=False, sleep_error=None):
         self.sessions, self.hr, self.since = sessions, hr, []
-        self.hrv, self.hrv_fails = hrv or {}, hrv_fails
+        self.hrv, self.hrv_fails, self.hr_fails, self.sleep_error = hrv or {}, hrv_fails, hr_fails, sleep_error
+        self.authorized = 0
+
+    def ensure_authorized(self):
+        self.authorized += 1
 
     def get_daily_hrv(self, since):
         if self.hrv_fails:
@@ -134,24 +138,31 @@ class FakeHealth:
         return {d: v for d, v in self.hrv.items() if d >= since.isoformat()}
 
     def get_sleep_sessions(self, since, min_minutes=180):
+        if self.sleep_error:
+            raise self.sleep_error
         self.since.append(since)
         return [s for s in self.sessions if s["end"] >= since]
 
     def get_sleeping_heart_rate(self, start, end):
+        if self.hr_fails:
+            raise RuntimeError("rollup 500")
         return self.hr
 
 
 class FakeGarmin:
-    def __init__(self, nights=None, fail=False):
+    def __init__(self, nights=None, fail=False, fail_dates=(), upload_fails=False):
         self.nights, self.fail, self.uploads, self.lookups = nights or {}, fail, [], []
+        self.fail_dates, self.upload_fails = set(fail_dates), upload_fails
 
     def get_sleep_summary(self, d):
         self.lookups.append(d)
-        if self.fail:
+        if self.fail or d in self.fail_dates:
             raise RuntimeError("boom")
         return self.nights.get(d)
 
     def upload_fit_for_window(self, fit_bytes, start):
+        if self.upload_fails:
+            raise RuntimeError("502")
         self.uploads.append((start, fit_bytes))
         return {"ok": True}
 
@@ -165,6 +176,91 @@ class TestRunSleepSync(unittest.TestCase):
         self.path = os.path.join(tempfile.mkdtemp(), "sleep.json")
         self.store = SleepStore(self.path)
         self.now = T + timedelta(hours=14)  # 6h after the 8h night ends
+
+    def test_failed_upload_is_retried_then_given_up(self):
+        s = session()
+        h, d = FakeHealth([s], hrv={wake_date(session()): 30}), wake_date(s)
+        g = FakeGarmin(upload_fails=True)
+        run_sleep_sync(CFG, h, g, self.store, now=self.now)
+        self.assertEqual(self.store.data["uploaded"], {})
+        self.assertNotIn(d, self.store.data["seen"])
+        g.upload_fails = False
+        run_sleep_sync(CFG, h, g, self.store, now=self.now)
+        self.assertEqual(len(g.uploads), 1)
+        self.assertEqual(self.store.data["seen"][d], "uploaded")
+        self.assertNotIn(d, self.store.data["failures"])
+        # A night that keeps failing is given up on after MAX_FAILURES.
+        other = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        g2 = FakeGarmin(upload_fails=True)
+        for _ in range(4):
+            run_sleep_sync(CFG, h, g2, other, now=self.now)
+        self.assertEqual(other.data["seen"][d], "failed")
+
+    def test_one_failing_date_does_not_block_the_others(self):
+        sessions = [session(T - timedelta(days=i)) for i in range(3)]
+        bad = wake_date(sessions[0])
+        g = FakeGarmin(fail_dates={bad})
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "calibration_days": 4, "upload_days": 0}}
+        h = FakeHealth(sessions)
+        for _ in range(3):
+            run_sleep_sync(cfg, h, g, self.store, now=self.now)
+        self.assertEqual(self.store.data["seen"][bad], "failed")
+        self.assertTrue(all(self.store.data["seen"].get(wake_date(x)) == "none" for x in sessions[1:]))
+        run_sleep_sync(cfg, h, g, self.store, now=self.now)
+        self.assertTrue(self.store.data["bootstrapped"])
+
+    def test_heart_rate_error_keeps_the_rest_of_the_run(self):
+        s = session()
+        d = wake_date(s)
+        g = FakeGarmin({d: {"start": s["start"] + timedelta(seconds=30), "end": s["end"], "score": 70, "need": 470,
+                            "asleep": 460.0, "hr": 55}})
+        run_sleep_sync(CFG, FakeHealth([s], hr_fails=True), g, self.store, now=self.now)
+        saved = SleepStore(self.path).data
+        self.assertIn(d, saved["garmin_nights"])  # the run's work was saved
+        self.assertNotIn(d, saved["pairs"])
+        self.assertNotIn(d, saved["seen"])  # retried next run
+
+    def test_refreshes_google_token(self):
+        h = FakeHealth([])
+        run_sleep_sync(CFG, h, FakeGarmin(), self.store, now=self.now)
+        self.assertEqual(h.authorized, 1)
+
+    def test_missing_sleep_scope_skips_sleep_without_failing(self):
+        import requests
+        resp = requests.Response()
+        resp.status_code = 403
+        g = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([], sleep_error=requests.HTTPError(response=resp)), g, self.store, now=self.now)
+        self.assertEqual(g.lookups, [])
+
+    def test_each_night_uses_its_own_need(self):
+        older, newer = session(T - timedelta(days=1)), session()
+        self.store.data["needs"] = {wake_date(older): 520, wake_date(newer): 440}
+        self.store.data["need"], self.store.data["need_date"] = 440, wake_date(newer)
+        self.assertEqual(self.store.need_for(wake_date(older)), 520)
+        self.assertEqual(self.store.need_for("2000-01-01"), 440)  # nothing earlier: latest
+        later = (date.fromisoformat(wake_date(newer)) + timedelta(days=3)).isoformat()
+        self.assertEqual(self.store.need_for(later), 440)
+
+    def test_recent_empty_dates_are_provisional(self):
+        # No Fitbit night and nothing on Garmin yet: yesterday/today are asked about again.
+        g = FakeGarmin()
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "calibration_days": 5}}
+        run_sleep_sync(cfg, FakeHealth([]), g, self.store, now=self.now)
+        today = self.now.date()
+        self.assertNotIn(today.isoformat(), self.store.data["seen"])
+        self.assertNotIn((today - timedelta(days=1)).isoformat(), self.store.data["seen"])
+        self.assertEqual(self.store.data["seen"][(today - timedelta(days=2)).isoformat()], "none")
+
+    def test_own_upload_recognised_by_uploaded_stage_window(self):
+        s = session()
+        s["stages"] = [stage(1, 400, "LIGHT"), stage(400, 470, "DEEP"), stage(470, 480, "WEIRD")]
+        d = wake_date(s)
+        g = FakeGarmin({d: {"start": T + timedelta(minutes=1), "end": T + timedelta(minutes=470), "score": 65,
+                            "need": 470, "asleep": 469.0, "hr": 58}})
+        run_sleep_sync(CFG, FakeHealth([s]), g, self.store, now=self.now)
+        self.assertEqual(self.store.data["seen"][d], "ours")
+        self.assertEqual(self.store.data["garmin_nights"], {})
 
     def test_disabled_does_nothing(self):
         g = FakeGarmin()
@@ -230,8 +326,8 @@ class TestRunSleepSync(unittest.TestCase):
         g = FakeGarmin()
         s = session()
         run_sleep_sync(CFG, FakeHealth([s]), g, self.store, now=T + timedelta(hours=9))
-        self.assertNotIn(wake_date(s), g.lookups)
         self.assertEqual(g.uploads, [])
+        self.assertNotIn(wake_date(s), self.store.data["seen"])  # decided after the holdback
 
     def test_watch_night_becomes_calibration_pair(self):
         s = session()
@@ -304,3 +400,26 @@ class TestRunSleepSync(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGarminSleepSummary(unittest.TestCase):
+    def _client(self, dto):
+        from unittest.mock import MagicMock
+        from garmin_client import GarminClient
+        c = GarminClient.__new__(GarminClient)
+        c._client = MagicMock()
+        c._client.get_sleep_data.return_value = {"dailySleepDTO": dto}
+        c._ensure_connected = lambda: None
+        return c
+
+    def test_incomplete_record_is_treated_as_no_sleep(self):
+        dto = {"sleepTimeSeconds": 25000, "sleepStartTimestampGMT": 1795294980000, "sleepEndTimestampGMT": None}
+        self.assertIsNone(self._client(dto).get_sleep_summary("2026-11-22"))
+
+    def test_summary_fields(self):
+        dto = {"sleepTimeSeconds": 28200, "sleepStartTimestampGMT": 1795294980000, "sleepEndTimestampGMT": 1795328100000,
+               "sleepScores": {"overall": {"value": 65}}, "sleepNeed": {"actual": 470}, "nextSleepNeed": {"actual": 480},
+               "avgSleepStress": 16.0, "avgHeartRate": 59.0}
+        g = self._client(dto).get_sleep_summary("2026-11-22")
+        self.assertEqual((g["score"], g["need"], g["next_need"], g["stress"], g["asleep"], g["hr"]),
+                         (65, 470, 480, 16.0, 470.0, 59.0))

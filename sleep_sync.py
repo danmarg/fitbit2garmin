@@ -14,7 +14,10 @@ Each run asks Garmin once about each local date (the night ending that morning):
   - a night we uploaded → ignored (never calibrate on our own output)
 
 A night counts as ours if it is in the uploaded list, or if Garmin's sleep window equals
-the Fitbit window to the second (our uploads copy it exactly; the watch's never do).
+the Fitbit window (or the stages we upload) to the second; the watch's never does.
+A night is recorded as uploaded only after Garmin answers; errors are retried on later
+runs, up to MAX_FAILURES per date. Garmin's answer for the last night or two is
+provisional (the watch may sync later), so empty dates there are asked about again.
 
 A Fitbit night is uploaded only once Fitbit has finished processing it and its HRV has
 arrived, or after `max_wait_hours` past waking at the latest. Watch nights found after
@@ -22,12 +25,13 @@ the initial scan also record what the models predicted before refitting
 (pred_score / pred_stress), and the running error is logged.
 
 The store (sleep.json in the state directory) holds:
-  seen:          {date: "uploaded" | "watch" | "ours" | "none"}
+  seen:          {date: "uploaded" | "watch" | "ours" | "none" | "failed"}
   uploaded:      {date: fitbit start ISO}
   garmin_nights: {date: {"asleep", "need", "hr", "score"}}
   pairs:         {date: {"asleep", "need", "hr", "hrv", "score", "stress", ["pred_score", "pred_stress"]}}
   weights / stress_weights: the learned models (None until nights are found)
-  need / need_date: Garmin's sleep need (minutes) for the latest night it is known for
+  needs:         {date: Garmin's sleep need (minutes)}; need / need_date: the latest
+  failures:      {date: count}; a date is given up on ("failed") after MAX_FAILURES
   bootstrapped:  whether the whole calibration window has been scanned once
 """
 
@@ -36,10 +40,14 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+import requests
+
 import sleep_score
-from fit_engine import build_sleep_fit
+from fit_engine import SLEEP_LEVELS, build_sleep_fit
 
 log = logging.getLogger("fitbit2garmin.sleep")
+
+MAX_FAILURES = 3
 
 SLEEP_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "data"), "sleep.json")
 
@@ -48,7 +56,7 @@ class SleepStore:
     def __init__(self, path: str = SLEEP_FILE):
         self.path = path
         self.data = {"seen": {}, "uploaded": {}, "garmin_nights": {}, "pairs": {}, "weights": None,
-                     "stress_weights": None, "need": None, "bootstrapped": False}
+                     "stress_weights": None, "need": None, "needs": {}, "failures": {}, "bootstrapped": False}
         try:
             with open(path) as f:
                 loaded = json.load(f)
@@ -79,9 +87,31 @@ class SleepStore:
         return self._valid(self.data.get("stress_weights"), sleep_score.GENERIC_STRESS_WEIGHTS)
 
     def remember_need(self, night: str, minutes):
-        """Keep Garmin's sleep need for the latest night it is known for."""
-        if minutes and night >= (self.data.get("need_date") or ""):
+        """Garmin's sleep need for `night`; also tracks the latest night it is known for."""
+        if not minutes:
+            return
+        self.data["needs"][night] = minutes
+        if night >= (self.data.get("need_date") or ""):
             self.data["need"], self.data["need_date"] = minutes, night
+
+    def need_for(self, night: str) -> float:
+        """That night's need, else the latest known on or before it, else the latest, else a default."""
+        needs = self.data["needs"]
+        if night in needs:
+            return needs[night]
+        earlier = [d for d in needs if d <= night]
+        if earlier:
+            return needs[max(earlier)]
+        return self.data.get("need") or sleep_score.DEFAULT_NEED_MINUTES
+
+    def fail(self, night: str, reason: str):
+        """Count a failure for a date; after MAX_FAILURES it is given up on."""
+        n = self.data["failures"][night] = self.data["failures"].get(night, 0) + 1
+        if n >= MAX_FAILURES:
+            self.data["seen"][night] = "failed"
+            log.warning("Sleep for %s: %s — giving up after %d attempts.", night, reason, n)
+        else:
+            log.warning("Sleep for %s: %s — will retry (%d/%d).", night, reason, n, MAX_FAILURES)
 
     def live_error(self) -> str | None:
         rows = [p for p in self.data["pairs"].values() if p.get("pred_score") is not None]
@@ -143,9 +173,19 @@ def _prev_day(d: str) -> str:
     return (datetime.fromisoformat(d) - timedelta(days=1)).date().isoformat()
 
 
+def _uploaded_window(session: dict) -> tuple[datetime, datetime] | None:
+    """The window build_sleep_fit writes: first to last stage it keeps."""
+    stages = [st for st in session["stages"] if st["type"] in SLEEP_LEVELS and st["end"] > st["start"]]
+    if not stages:
+        return None
+    return min(st["start"] for st in stages), max(st["end"] for st in stages)
+
+
 def _same_window(garmin_night: dict, session: dict) -> bool:
-    return (abs((garmin_night["start"] - session["start"]).total_seconds()) <= 1
-            and abs((garmin_night["end"] - session["end"]).total_seconds()) <= 1)
+    """Garmin's window equals ours to the second: the session interval or the uploaded stages."""
+    close = lambda a, b: abs((a - b).total_seconds()) <= 1
+    windows = [(session["start"], session["end"]), _uploaded_window(session)]
+    return any(w and close(garmin_night["start"], w[0]) and close(garmin_night["end"], w[1]) for w in windows)
 
 
 def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime | None = None):
@@ -160,27 +200,43 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     lookups_per_run = scfg.get("max_garmin_lookups", 60)
     device = cfg["device"]
 
+    health.ensure_authorized()  # the heart-rate sync may not have refreshed the token
+
     # Scan the whole calibration window until it has been covered once, then only recent nights.
     window_days = calibration_days if not store.data["bootstrapped"] else max(upload_days, 3)
-    sessions = health.get_sleep_sessions(now - timedelta(days=window_days),
-                                         min_minutes=scfg.get("min_minutes", 180))
+    try:
+        sessions = health.get_sleep_sessions(now - timedelta(days=window_days),
+                                             min_minutes=scfg.get("min_minutes", 180))
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            log.error("Google Health refused the sleep data (%s). The token may lack the "
+                      "googlehealth.sleep.readonly scope: run the Google authorization again. "
+                      "Skipping sleep this run.", e.response.status_code)
+            return
+        raise
     nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
     try:
         hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())
     except Exception as e:
-        log.warning("Fitbit HRV unavailable (%s) — stress uses the default HRV this run.", e)
+        log.warning("Fitbit HRV unavailable (%s) — nights wait for it, up to max_wait_hours.", e)
         hrv_by_date = {}
     recent = now - timedelta(days=upload_days)
     seen = store.data["seen"]
-    # Every date in the window (watch nights matter even without a Fitbit night), except
-    # today unless Fitbit already has its night. "none" Fitbit nights become eligible
-    # again if upload_days is raised to cover them.
+    # Dates are local: use the offset of the latest Fitbit night (UTC if none).
+    offset = max(sessions, key=lambda x: x["end"])["utc_offset_seconds"] if sessions else 0
+    local_today = (now + timedelta(seconds=offset)).date()
+    # Garmin may not have the last night or two yet (the watch syncs later), so an empty
+    # answer for those is provisional and they are asked about again next run.
+    provisional_from = (local_today - timedelta(days=1)).isoformat()
+    # Every date in the window (watch nights matter even without a Fitbit night).
+    # "none" Fitbit nights become eligible again if upload_days is raised to cover them.
     first = (now - timedelta(days=window_days)).date()
-    dates = {(first + timedelta(days=i)).isoformat() for i in range((now.date() - first).days)} | set(nights)
+    dates = {(first + timedelta(days=i)).isoformat() for i in range((local_today - first).days + 1)} | set(nights)
     pending = sorted((d for d in dates if d not in seen
                       or (seen[d] == "none" and d in nights and nights[d]["end"] >= recent)), reverse=True)
 
     lookups = 0
+    errors_in_a_row = 0
     complete = True
     learned = False
     to_upload = []
@@ -193,14 +249,22 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         try:
             g = garmin.get_sleep_summary(d)
         except Exception as e:
-            log.warning("Garmin sleep lookup for %s failed (%s) — will retry next run.", d, e)
             complete = False
-            break
+            store.fail(d, f"Garmin sleep lookup failed ({e})")
+            errors_in_a_row += 1
+            if errors_in_a_row >= 3:
+                log.warning("Garmin sleep lookups keep failing — stopping for this run.")
+                break
+            continue
+        errors_in_a_row = 0
         if g:
             store.remember_need(d, g.get("need"))
             store.remember_need(_next_day(d), g.get("next_need"))
         if g is None:
-            if s is None or s["end"] < recent:
+            if s is None:
+                if d < provisional_from:
+                    seen[d] = "none"
+            elif s["end"] < recent:
                 seen[d] = "none"
             elif (s.get("processed", True) and d in hrv_by_date) or now - s["end"] >= max_wait:
                 to_upload.append(d)
@@ -209,17 +273,21 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                          "" if d in hrv_by_date else " and its HRV")
         elif d in store.data["uploaded"] or (s is not None and _same_window(g, s)):
             seen[d] = "ours"
+        elif g.get("score") is None:
+            seen[d] = "watch"  # watch night without a score: nothing to learn
         else:
-            seen[d] = "watch"
-            if g.get("score") is None:
-                continue  # watch night without a score: nothing to learn
             need = g.get("need") or sleep_score.DEFAULT_NEED_MINUTES
             if g.get("hr"):
                 store.data["garmin_nights"][d] = {"asleep": round(g["asleep"], 1), "need": need, "hr": g["hr"],
                                                   "score": g["score"]}
                 learned = True
             if s is not None:
-                hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+                try:
+                    hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+                except Exception as e:
+                    complete = False
+                    store.fail(d, f"Fitbit heart rate unavailable ({e})")
+                    continue
                 pair = {"asleep": round(asleep_minutes(s), 1), "need": need,
                         "hr": None if hr is None else round(hr, 2), "hrv": hrv_by_date.get(d),
                         "score": g["score"], "stress": g.get("stress")}
@@ -232,6 +300,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                              d, g["score"], pair["pred_score"], g.get("stress"), pair["pred_stress"])
                 store.data["pairs"][d] = pair
                 learned = True
+            seen[d] = "watch"
     if complete and not store.data["bootstrapped"]:
         store.data["bootstrapped"] = True
         log.info("Sleep calibration: initial scan done, %d watch night(s) found, %d also recorded by Fitbit.",
@@ -253,26 +322,36 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         if prev:
             store.remember_need(_prev_day(d), prev.get("need"))
             store.remember_need(d, prev.get("next_need"))
-        need = store.data.get("need") or sleep_score.DEFAULT_NEED_MINUTES
-        minutes = stage_minutes(s)
-        hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+        need = store.need_for(d)
+        try:
+            hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+        except Exception as e:
+            store.fail(d, f"Fitbit heart rate unavailable ({e})")
+            store.save()
+            continue
         score = sleep_score.predict(store.weights, asleep_minutes(s), need, hr)
         stress = sleep_score.predict_stress(store.stress_weights, hr, hrv_by_date.get(d))
         fit_bytes = build_sleep_fit(
             s["stages"], device["manufacturer"], device["product_id"], device["serial_number"],
-            assessment=sleep_score.assessment(minutes, need, score, stress),
+            assessment=sleep_score.assessment(stage_minutes(s), need, score, stress),
             software_version=device.get("software_version", 331),
             utc_offset_seconds=s["utc_offset_seconds"],
         )
-        log.info("Uploading sleep for %s (%s–%s UTC, %.0f min asleep, sleeping HR %s, HRV %s ms; "
+        log.info("Uploading sleep for %s (%s–%s UTC, %.0f min asleep, need %.0f, sleeping HR %s, HRV %s ms; "
                  "estimated score %d, stress %s).",
-                 d, f"{s['start']:%H:%M}", f"{s['end']:%H:%M}", asleep_minutes(s),
+                 d, f"{s['start']:%H:%M}", f"{s['end']:%H:%M}", asleep_minutes(s), need,
                  "n/a" if hr is None else f"{hr:.0f}", hrv_by_date.get(d, "n/a"), score,
                  "n/a" if stress is None else f"{stress:.0f}")
-        # Record first: a retry would only be rejected as a duplicate, and a night that
-        # Garmin silently drops must not be uploaded again every hour.
-        store.data["uploaded"][d] = s["start"].isoformat()
-        store.data["seen"][d] = "uploaded"
-        store.save()
-        result = garmin.upload_fit_for_window(fit_bytes, s["start"])
+        try:
+            result = garmin.upload_fit_for_window(fit_bytes, s["start"])
+        except Exception as e:
+            store.fail(d, f"upload failed ({e})")
+            store.save()
+            continue
+        # Recorded only once Garmin answered (a duplicate counts): a night Garmin
+        # accepts but doesn't show must not be uploaded again every hour.
         log.info("Sleep upload complete: %s", result)
+        store.data["uploaded"][d] = s["start"].isoformat()
+        seen[d] = "uploaded"
+        store.data["failures"].pop(d, None)
+        store.save()

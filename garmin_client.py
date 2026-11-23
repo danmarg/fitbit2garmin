@@ -142,8 +142,8 @@ class GarminClient:
         self._ensure_connected()
         data = self._client.get_sleep_data(date) or {}
         dto = data.get("dailySleepDTO") or {}
-        if not dto.get("sleepTimeSeconds") or not dto.get("sleepStartTimestampGMT"):
-            return None
+        if not (dto.get("sleepTimeSeconds") and dto.get("sleepStartTimestampGMT") and dto.get("sleepEndTimestampGMT")):
+            return None  # no sleep, or an incomplete record: treat both as nothing there
         ts = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
         return {
             "start": ts(dto["sleepStartTimestampGMT"]),
