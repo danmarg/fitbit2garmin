@@ -73,8 +73,12 @@ Sleep FIT layout (type 49, copied from a real FR255S file): file_id, file_creato
 device_info, sleep_data_info (273), sleep start/stop events (74), sleep_assessment (346),
 sleep_level (275) stamped at each stage's END (1 awake, 2 light, 3 deep, 4 REM).
 Garmin stores nothing without real values in 346; it shows overall_sleep_score as is.
-The score model is linear in hours short of / over Garmin's sleep need and sleeping HR,
-shrunk toward `sleep_score.DEFAULT_WEIGHTS` (fitted on 200 nights, ~4 points MAE).
+Score and stress are learned at runtime from the user's own Garmin history (sleep.json):
+a baseline from every watch night (Garmin's minutes asleep vs sleep need, sleeping HR),
+then a fit on nights the Fitbit also recorded, shrunk toward it. Score features: hours
+short of need, hours short beyond 3, hours over need (capped at 1), sleeping HR. Stress
+features: sleeping HR, Fitbit nightly HRV. Only rough GENERIC_* starting values are in
+code. Forward-chaining on one user's history: score ~3.9 points, stress ~1.3.
 
 ### Key files
 

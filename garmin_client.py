@@ -135,7 +135,8 @@ class GarminClient:
         """
         Garmin's sleep for the night ending on local `date` (YYYY-MM-DD):
         {"start", "end" (UTC datetimes), "score" (int | None), "need" (minutes | None),
-         "stress" (average sleep stress | None)},
+         "stress" (average sleep stress | None), "next_need" (need for the following night),
+         "asleep" (minutes), "hr" (average sleeping heart rate | None)},
         or None if Garmin has no sleep that night. Errors propagate to the caller.
         """
         self._ensure_connected()
@@ -150,6 +151,9 @@ class GarminClient:
             "score": ((dto.get("sleepScores") or {}).get("overall") or {}).get("value"),
             "need": (dto.get("sleepNeed") or {}).get("actual"),
             "stress": dto.get("avgSleepStress"),
+            "next_need": (dto.get("nextSleepNeed") or {}).get("actual"),
+            "asleep": dto["sleepTimeSeconds"] / 60,
+            "hr": dto.get("avgHeartRate"),
         }
 
     def upload_fit(self, fit_bytes: bytes, filename: str = "monitoring.fit") -> dict:

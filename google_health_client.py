@@ -303,10 +303,13 @@ class GoogleHealthClient:
                 log.info("Sleep session %s has no stages; skipping.", dp.get("name"))
                 continue
             offset = interval.get("endUtcOffset") or interval.get("startUtcOffset") or "0s"
+            meta = s.get("metadata") or {}
             out.append({
                 "id": dp.get("name"),
                 "start": start,
                 "end": end,
+                # Fitbit keeps refining a night for hours after waking; upload only once it is done.
+                "processed": bool(meta.get("processed", True)) and meta.get("stagesStatus", "SUCCEEDED") == "SUCCEEDED",
                 "utc_offset_seconds": int(float(str(offset).rstrip("s"))),
                 "stages": sorted(stages, key=lambda x: x["start"]),
             })
