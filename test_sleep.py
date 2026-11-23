@@ -79,11 +79,30 @@ class TestSleepScore(unittest.TestCase):
         self.assertEqual(sleep_score.predict([500, 0, 0, 0], 1, 1, 60), 100)
         self.assertEqual(sleep_score.predict([-5, 0, 0, 0], 1, 1, 60), 0)
 
+    def test_stress_fit_recovers_weights(self):
+        true = [20.0, 0.6, -0.5]
+        pairs = [{"date": "2026-10-01", "hr": 50 + i % 20, "hrv": 15 + (i * 7) % 30,
+                  "stress": sum(w * x for w, x in zip(true, sleep_score.stress_features(50 + i % 20, 15 + (i * 7) % 30)))}
+                 for i in range(100)]
+        pairs.append({"date": "2026-10-01", "hr": 60, "hrv": None, "stress": 99})  # incomplete: ignored
+        w = sleep_score.fit_stress(pairs, prior=[0, 0, 0], lam=0.001, today=date(2026, 10, 1))
+        for a, b in zip(w, true):
+            self.assertAlmostEqual(a, b, places=2)
+
+    def test_predict_stress(self):
+        self.assertIsNone(sleep_score.predict_stress(sleep_score.DEFAULT_STRESS_WEIGHTS, None, 30))
+        low = sleep_score.predict_stress(sleep_score.DEFAULT_STRESS_WEIGHTS, 52, 40)
+        high = sleep_score.predict_stress(sleep_score.DEFAULT_STRESS_WEIGHTS, 66, 15)
+        self.assertLess(low, high)
+        self.assertEqual(sleep_score.predict_stress([500, 0, 0], 60, 25), 100)
+
     def test_assessment_fields(self):
         a = sleep_score.assessment({"DEEP": 90, "LIGHT": 250, "REM": 100, "AWAKE": 12, "AWAKE_COUNT": 2}, 470, 77)
         self.assertEqual((a["overall_sleep_score"], a["awakenings_count"], a["deep_sleep_score"]), (77, 2, 100))
         self.assertLess(a["sleep_duration_score"], 100)
         self.assertTrue(all(0 <= v <= 255 for v in a.values()))
+        self.assertNotIn("average_stress_during_sleep", a)
+        self.assertEqual(sleep_score.assessment({"LIGHT": 400}, 470, 70, 18.37)["average_stress_during_sleep"], 1837)
 
 
 class TestSleepSource(unittest.TestCase):
@@ -98,8 +117,14 @@ class TestSleepSource(unittest.TestCase):
 
 
 class FakeHealth:
-    def __init__(self, sessions, hr=58.0):
+    def __init__(self, sessions, hr=58.0, hrv=None, hrv_fails=False):
         self.sessions, self.hr, self.since = sessions, hr, []
+        self.hrv, self.hrv_fails = hrv or {}, hrv_fails
+
+    def get_daily_hrv(self, since):
+        if self.hrv_fails:
+            raise RuntimeError("no hrv")
+        return {d: v for d, v in self.hrv.items() if d >= since.isoformat()}
 
     def get_sleep_sessions(self, since, min_minutes=180):
         self.since.append(since)
@@ -141,10 +166,18 @@ class TestRunSleepSync(unittest.TestCase):
 
     def test_uploads_night_garmin_lacks_once(self):
         s, g = session(), FakeGarmin()
-        run_sleep_sync(CFG, FakeHealth([s]), g, self.store, now=self.now)
+        run_sleep_sync(CFG, FakeHealth([s], hr=61, hrv={wake_date(s): 21.5}), g, self.store, now=self.now)
         self.assertEqual(len(g.uploads), 1)
+        a = next(m for m in fitparse.FitFile(io.BytesIO(g.uploads[0][1])).get_messages() if m.mesg_num == 346)
+        expected = sleep_score.predict_stress(sleep_score.DEFAULT_STRESS_WEIGHTS, 61, 21.5)
+        self.assertEqual({d.def_num: d.raw_value for d in a}[15], round(expected * 100))
         self.assertEqual(SleepStore(self.path).data["uploaded"], {wake_date(s): s["start"].isoformat()})
         run_sleep_sync(CFG, FakeHealth([s]), g, SleepStore(self.path), now=self.now + timedelta(hours=1))
+        self.assertEqual(len(g.uploads), 1)
+
+    def test_hrv_failure_still_uploads(self):
+        g = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([session()], hrv_fails=True), g, self.store, now=self.now)
         self.assertEqual(len(g.uploads), 1)
 
     def test_holdback(self):
@@ -156,11 +189,13 @@ class TestRunSleepSync(unittest.TestCase):
         s = session()
         d = wake_date(s)
         g = FakeGarmin({d: {"start": s["start"] + timedelta(minutes=7, seconds=13), "end": s["end"] - timedelta(seconds=41),
-                            "score": 81, "need": 450}})
-        run_sleep_sync(CFG, FakeHealth([s], hr=55.5), g, self.store, now=self.now)
+                            "score": 81, "need": 450, "stress": 17.0}})
+        run_sleep_sync(CFG, FakeHealth([s], hr=55.5, hrv={d: 31.2}), g, self.store, now=self.now)
         data = SleepStore(self.path).data
         self.assertEqual(g.uploads, [])
-        self.assertEqual(data["pairs"][d], {"asleep": 470.0, "need": 450, "hr": 55.5, "score": 81})
+        self.assertEqual(data["pairs"][d], {"asleep": 470.0, "need": 450, "hr": 55.5, "hrv": 31.2, "score": 81,
+                                            "stress": 17.0})
+        self.assertNotEqual(data["stress_weights"], sleep_score.DEFAULT_STRESS_WEIGHTS)
         self.assertEqual(data["need"], 450)
         self.assertNotEqual(data["weights"], sleep_score.DEFAULT_WEIGHTS)
 

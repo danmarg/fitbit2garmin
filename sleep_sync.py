@@ -15,8 +15,8 @@ the Fitbit window to the second (our uploads copy it exactly; the watch's never 
 The store (sleep.json in the state directory) holds:
   seen:     {wake_date: "uploaded" | "watch" | "ours" | "none"}
   uploaded: {wake_date: fitbit start ISO}
-  pairs:    {wake_date: {"asleep", "need", "hr", "score"}}
-  weights:  current model; need / need_date: Garmin's sleep need (minutes) on the latest night seen
+  pairs:    {wake_date: {"asleep", "need", "hr", "hrv", "score", "stress"}}
+  weights / stress_weights: current score and stress models; need / need_date: Garmin's sleep need (minutes) on the latest night seen
   bootstrapped: whether the full calibration window has been scanned once
 """
 
@@ -36,7 +36,8 @@ SLEEP_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "data"), "sleep.json
 class SleepStore:
     def __init__(self, path: str = SLEEP_FILE):
         self.path = path
-        self.data = {"seen": {}, "uploaded": {}, "pairs": {}, "weights": None, "need": None, "bootstrapped": False}
+        self.data = {"seen": {}, "uploaded": {}, "pairs": {}, "weights": None, "stress_weights": None,
+                     "need": None, "bootstrapped": False}
         try:
             with open(path) as f:
                 loaded = json.load(f)
@@ -59,11 +60,20 @@ class SleepStore:
         w = self.data.get("weights")
         return w if isinstance(w, list) and len(w) == len(sleep_score.DEFAULT_WEIGHTS) else sleep_score.DEFAULT_WEIGHTS
 
+    @property
+    def stress_weights(self) -> list[float]:
+        w = self.data.get("stress_weights")
+        ok = isinstance(w, list) and len(w) == len(sleep_score.DEFAULT_STRESS_WEIGHTS)
+        return w if ok else sleep_score.DEFAULT_STRESS_WEIGHTS
+
     def refit(self, today):
         pairs = [{"date": d, **p} for d, p in self.data["pairs"].items()]
         self.data["weights"] = sleep_score.fit(pairs, today=today)
-        log.info("Sleep score model refitted on %d watch night(s): %s", len(pairs),
-                 ", ".join(f"{n}={w:.2f}" for n, w in zip(sleep_score.FEATURE_NAMES, self.data["weights"])))
+        self.data["stress_weights"] = sleep_score.fit_stress(pairs, today=today)
+        fmt = lambda names, ws: ", ".join(f"{n}={w:.2f}" for n, w in zip(names, ws))
+        log.info("Sleep models refitted on %d watch night(s): score %s; stress %s", len(pairs),
+                 fmt(sleep_score.FEATURE_NAMES, self.data["weights"]),
+                 fmt(sleep_score.STRESS_FEATURE_NAMES, self.data["stress_weights"]))
 
 
 def wake_date(session: dict) -> str:
@@ -115,6 +125,11 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     sessions = health.get_sleep_sessions(now - timedelta(days=window_days),
                                          min_minutes=scfg.get("min_minutes", 180))
     nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
+    try:
+        hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())
+    except Exception as e:
+        log.warning("Fitbit HRV unavailable (%s) — stress uses the default HRV this run.", e)
+        hrv_by_date = {}
     recent = now - timedelta(days=upload_days)
     seen = store.data["seen"]
     # "none" nights become eligible again if upload_days is raised to cover them.
@@ -150,8 +165,10 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
             store.data["seen"][d] = "watch"  # watch night without a score: nothing to learn
         else:
             hr = health.get_sleeping_heart_rate(s["start"], s["end"])
-            store.data["pairs"][d] = {"asleep": round(asleep_minutes(s), 1), "need": g.get("need") or sleep_score.DEFAULT_NEED_MINUTES,
-                                      "hr": None if hr is None else round(hr, 2), "score": g["score"]}
+            store.data["pairs"][d] = {"asleep": round(asleep_minutes(s), 1),
+                                      "need": g.get("need") or sleep_score.DEFAULT_NEED_MINUTES,
+                                      "hr": None if hr is None else round(hr, 2), "hrv": hrv_by_date.get(d),
+                                      "score": g["score"], "stress": g.get("stress")}
             store.data["seen"][d] = "watch"
             pairs_added = True
     if complete and not store.data["bootstrapped"]:
@@ -167,15 +184,18 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         minutes = stage_minutes(s)
         hr = health.get_sleeping_heart_rate(s["start"], s["end"])
         score = sleep_score.predict(store.weights, asleep_minutes(s), need, hr)
+        stress = sleep_score.predict_stress(store.stress_weights, hr, hrv_by_date.get(d))
         fit_bytes = build_sleep_fit(
             s["stages"], device["manufacturer"], device["product_id"], device["serial_number"],
-            assessment=sleep_score.assessment(minutes, need, score),
+            assessment=sleep_score.assessment(minutes, need, score, stress),
             software_version=device.get("software_version", 331),
             utc_offset_seconds=s["utc_offset_seconds"],
         )
-        log.info("Uploading sleep for %s (%s–%s UTC, %.0f min asleep, sleeping HR %s, estimated score %d).",
+        log.info("Uploading sleep for %s (%s–%s UTC, %.0f min asleep, sleeping HR %s, HRV %s ms; "
+                 "estimated score %d, stress %s).",
                  d, f"{s['start']:%H:%M}", f"{s['end']:%H:%M}", asleep_minutes(s),
-                 "n/a" if hr is None else f"{hr:.0f}", score)
+                 "n/a" if hr is None else f"{hr:.0f}", hrv_by_date.get(d, "n/a"), score,
+                 "n/a" if stress is None else f"{stress:.0f}")
         # Record first: a retry would only be rejected as a duplicate, and a night that
         # Garmin silently drops must not be uploaded again every hour.
         store.data["uploaded"][d] = s["start"].isoformat()

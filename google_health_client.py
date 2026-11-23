@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -321,6 +321,35 @@ class GoogleHealthClient:
         sessions = self.parse_sleep_sessions(points, min_minutes=min_minutes, platform=platform)
         log.info("Google Health sleep: %d session(s) since %s", len(sessions), f"{since:%Y-%m-%d %H:%M}")
         return sessions
+
+    def get_daily_hrv(self, since: date, platform: str = "FITBIT") -> dict[str, float]:
+        """
+        Nightly HRV (average RMSSD, ms) by date, from `platform`, for dates >= `since`.
+        The list comes newest first; paging stops once a page is entirely older than `since`.
+        """
+        params = {"pageSize": 1000}
+        out: dict[str, float] = {}
+        while True:
+            resp = self.http.get(f"{API_BASE}/daily-heart-rate-variability/dataPoints",
+                                 headers=self._auth_headers(), params=params)
+            if not resp.ok:
+                log.error("Google Health daily HRV list failed: %d %s", resp.status_code, resp.text)
+                resp.raise_for_status()
+            body = resp.json()
+            dates = []
+            for dp in body.get("dataPoints", []):
+                v = dp.get("dailyHeartRateVariability") or {}
+                d = v.get("date") or {}
+                if not d.get("year"):
+                    continue
+                day = date(d["year"], d["month"], d["day"])
+                dates.append(day)
+                ms = v.get("averageHeartRateVariabilityMilliseconds")
+                if (dp.get("dataSource") or {}).get("platform") == platform and ms and day >= since:
+                    out[day.isoformat()] = float(ms)
+            if not body.get("nextPageToken") or (dates and max(dates) < since):
+                return out
+            params["pageToken"] = body["nextPageToken"]
 
     def get_sleeping_heart_rate(self, start: datetime, end: datetime) -> float | None:
         """Average heart rate over a sleep session (None if there are no readings)."""
