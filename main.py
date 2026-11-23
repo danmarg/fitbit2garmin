@@ -16,6 +16,7 @@ import yaml
 from google_health_client import GoogleHealthClient
 from fit_engine import build_monitoring_fit
 from garmin_client import GarminClient
+from sleep_sync import SleepStore, run_sleep_sync
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,7 +108,8 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     """
     Split a list of per-minute points into contiguous segments.
     A new segment begins whenever two consecutive points are more than
-    `gap_minutes` apart (e.g. the tracker was off-wrist or data was missing).
+    `gap_minutes` apart (e.g. the tracker was off-wrist or data was missing), or
+    their UTC offsets differ (a DST change), since a FIT file has one local offset.
     """
     if not points:
         return []
@@ -115,7 +117,7 @@ def split_segments(points: list[dict], gap_minutes: int = 5) -> list[list[dict]]
     current = [points[0]]
     for prev, pt in zip(points, points[1:]):
         delta = pt["datetime"] - prev["datetime"]
-        if delta > timedelta(minutes=gap_minutes):
+        if delta > timedelta(minutes=gap_minutes) or pt.get("utc_offset_seconds") != prev.get("utc_offset_seconds"):
             segments.append(current)
             current = []
         current.append(pt)
@@ -169,6 +171,9 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
     backfill_hours = sync_cfg.get("backfill_hours", 48)
     backfill_min_minutes = sync_cfg.get("backfill_min_minutes", 10)
     backfill_max_attempts = sync_cfg.get("backfill_max_attempts", 3)
+    # Garmin may not show an upload in its daily views for a while; don't treat the
+    # last cycle's minutes as missing yet, or they (and their steps) would be sent twice.
+    backfill_settle_minutes = sync_cfg.get("backfill_settle_minutes", 90)
     recency_minutes = sync_cfg.get("recency_minutes", 60)
 
     # 1. Pull Google Health data. Fetching the backfill window as well means data
@@ -201,11 +206,17 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
     now = datetime.now(timezone.utc)
     last_uploaded = state.load_last_uploaded()
     if last_uploaded is None:
-        # First run: don't treat the whole backfill window as new data.
+        # First run: upload only the lookback window as new data. Later cycles fill
+        # holes Garmin has anywhere in the backfill window (before the watermark),
+        # including minutes from before this tool was installed.
         first_cutoff = now - timedelta(hours=lookback)
         points = [p for p in points if p["datetime"] >= first_cutoff]
     new_points = [p for p in points if last_uploaded is None or p["datetime"] > last_uploaded]
-    old_points = [p for p in points if last_uploaded is not None and p["datetime"] <= last_uploaded]
+    # Backfill candidates use the same window as the attempt counts below (otherwise a
+    # minute whose count was pruned would be retried forever), and must have settled.
+    backfill_cutoff = now - timedelta(hours=backfill_hours)
+    settled = None if last_uploaded is None else last_uploaded - timedelta(minutes=backfill_settle_minutes)
+    old_points = [p for p in points if settled is not None and backfill_cutoff <= p["datetime"] <= settled]
 
     by_date = garmin.get_coverage_by_date(points, utc_offset_seconds)
     if by_date is None:
@@ -246,7 +257,6 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
 
     # 5. Backfill: minutes uploaded before but missing on Garmin now. Attempts are
     #    counted per minute, so a gap that shrinks or shifts keeps its count.
-    backfill_cutoff = now - timedelta(hours=backfill_hours)
     attempts = {m: n for m, n in state.load_backfill_attempts().items() if m >= backfill_cutoff}
     runs = select_backfill_runs(old_points, min_minutes=backfill_min_minutes)
     if runs:
@@ -268,9 +278,14 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
                 attempts[p["datetime"]] = attempts.get(p["datetime"], 0) + 1
             state.save_backfill_attempts(attempts)
             # Shift time_created a few seconds earlier per attempt so Garmin doesn't
-            # reject it as a duplicate of an earlier upload starting at the same minute.
-            result = _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=tries + 1)
-            log.info("Backfill upload complete: %s", result)
+            # reject it as a duplicate of an earlier upload starting at the same minute
+            # (kept under a minute so it can't collide with the minute before).
+            try:
+                result = _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=tries % 59 + 1)
+                log.info("Backfill upload complete: %s", result)
+            except Exception as e:
+                # Backfill is best effort: new data is already uploaded; try the rest.
+                log.warning("Backfill upload of %s failed: %s", label, e)
     state.save_backfill_attempts(attempts)
 
     log.info("=== Fitbit2Garmin cycle done ===")
@@ -295,13 +310,23 @@ def main():
 
     hooks = cfg.get("sync", {}).get("hooks", {})
 
+    failed = False
     try:
         run_sync(cfg, health, garmin, state)
-        run_hook(hooks.get("on_success"))
     except Exception as e:
         log.exception("Sync cycle failed: %s", e)
+        failed = True
+    # Sleep runs even if the heart-rate sync failed, and vice versa.
+    try:
+        run_sleep_sync(cfg, health, garmin, SleepStore())
+    except Exception as e:
+        log.exception("Sleep sync failed: %s", e)
+        failed = True
+
+    if failed:
         run_hook(hooks.get("on_failure"))
         sys.exit(1)
+    run_hook(hooks.get("on_success"))
 
 
 if __name__ == "__main__":

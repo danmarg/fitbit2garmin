@@ -272,3 +272,160 @@ def build_monitoring_fit(
         file_crc,
     )
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Sleep
+# ---------------------------------------------------------------------------
+
+MESG_NUM_FILE_CREATOR = 49
+MESG_NUM_SLEEP_LEVEL = 275
+MESG_NUM_SLEEP_ASSESSMENT = 346
+FILE_TYPE_SLEEP = 49
+SLEEP_LEVELS = {"AWAKE": 1, "LIGHT": 2, "DEEP": 3, "REM": 4}
+MESG_NUM_EVENT = 21
+MESG_NUM_SLEEP_DATA_INFO = 273
+EVENT_SLEEP = 74
+
+
+def _sleep_level_records(stages: list[dict]) -> tuple[int, int, list[tuple[int, int]]]:
+    """
+    Turn stages into (start_ts, end_ts, [(ts, level), ...]) in Garmin epoch seconds.
+
+    A real watch writes one sleep_level record per stage, stamped with the stage's END
+    (verified 2026-11-23: Garmin showed light 22:52:59–23:01:59 for a record
+    "23:01:59 level 2" after the 22:52:59 sleep-start event). Overlaps are clipped,
+    gaps between stages become AWAKE, and adjacent equal levels are merged.
+    """
+    stages = sorted(
+        (s for s in stages if s["type"] in SLEEP_LEVELS and s["end"] > s["start"]),
+        key=lambda x: x["start"],
+    )
+    if not stages:
+        raise ValueError("No sleep stages provided")
+    start_ts = cursor = to_garmin_ts(stages[0]["start"])
+    out: list[tuple[int, int]] = []
+
+    def emit(ts, level):
+        if out and out[-1][1] == level:
+            out[-1] = (ts, level)
+        else:
+            out.append((ts, level))
+
+    for st in stages:
+        s, e = to_garmin_ts(st["start"]), to_garmin_ts(st["end"])
+        if e <= cursor:
+            continue
+        if s > cursor:
+            emit(s, SLEEP_LEVELS["AWAKE"])
+        emit(e, SLEEP_LEVELS[st["type"]])
+        cursor = e
+    return start_ts, cursor, out
+
+
+# sleep_assessment (346) fields, in the order the FR255S writes them; names follow the
+# FIT SDK. Fields not given are written as invalid. Garmin shows overall_sleep_score as
+# the night's score, and stores nothing without real values here (2026-11-23).
+SLEEP_ASSESSMENT_FIELDS = [
+    # (field_def_num, name, size, base_type, struct format)
+    (15, "average_stress_during_sleep", 2, UINT16, "H"),  # stress x 100
+    (0,  "combined_awake_score", 1, UINT8, "B"),
+    (1,  "awake_time_score", 1, UINT8, "B"),
+    (2,  "awakenings_count_score", 1, UINT8, "B"),
+    (3,  "deep_sleep_score", 1, UINT8, "B"),
+    (4,  "sleep_duration_score", 1, UINT8, "B"),
+    (5,  "light_sleep_score", 1, UINT8, "B"),
+    (6,  "overall_sleep_score", 1, UINT8, "B"),
+    (7,  "sleep_quality_score", 1, UINT8, "B"),
+    (8,  "sleep_recovery_score", 1, UINT8, "B"),
+    (9,  "rem_sleep_score", 1, UINT8, "B"),
+    (10, "sleep_restlessness_score", 1, UINT8, "B"),
+    (11, "awakenings_count", 1, UINT8, "B"),
+    (12, "unknown_12", 1, ENUM, "B"),
+    (13, "unknown_13", 1, ENUM, "B"),
+    (14, "interruptions_score", 1, UINT8, "B"),
+    (16, "unknown_16", 1, ENUM, "B"),
+]
+
+
+def _sleep_assessment_message(local_mesg_num: int, values: dict) -> bytes:
+    defn = _definition_record(local_mesg_num, MESG_NUM_SLEEP_ASSESSMENT,
+                              [(num, size, base) for num, _, size, base, _ in SLEEP_ASSESSMENT_FIELDS])
+    invalid = {"H": 0xFFFF, "B": 0xFF}
+    row = [values.get(name, invalid[fmt]) for _, name, _, _, fmt in SLEEP_ASSESSMENT_FIELDS]
+    fmt = "".join(f for *_, f in SLEEP_ASSESSMENT_FIELDS)
+    return defn + _data_record(local_mesg_num, row, fmt)
+
+
+def _wrap_fit(messages: bytes) -> bytes:
+    """Prepend the 14-byte FIT header and append the file CRC."""
+    header = struct.pack("<BBHI4sH", 14, FIT_PROTOCOL_VERSION, int(FIT_PROFILE_VERSION),
+                         len(messages), b".FIT", 0x0000)
+    header = header[:12] + struct.pack("<H", fit_crc(header[:12]))
+    raw = header + messages
+    return raw + struct.pack("<H", fit_crc(raw))
+
+
+def build_sleep_fit(
+    stages: list[dict],
+    manufacturer: int,
+    product_id: int,
+    serial_number: int,
+    assessment: dict,
+    software_version: int = 331,
+    utc_offset_seconds: int = 0,
+    created_delay: int = 60,
+) -> bytes:
+    """
+    Build a sleep FIT file (file_id.type 49) for one night, laid out like the file a
+    Forerunner 255S writes (GBN71003.fit, which Garmin accepted on 2026-11-23):
+    file_id, file_creator, device_info, sleep_data_info (273), sleep start/stop events
+    (74), sleep_assessment (346), then sleep_level (275) records stamped at each
+    stage's END. `assessment` maps SLEEP_ASSESSMENT_FIELDS names to values; Garmin
+    ignores the night without it. time_created is created_delay seconds after waking.
+    """
+    start_ts, end_ts, levels = _sleep_level_records(stages)
+    created = end_ts + created_delay
+
+    m = b""
+    m += _definition_record(0, MESG_NUM_FILE_ID, [
+        (3, 4, UINT32Z),  # serial_number
+        (4, 4, UINT32),   # time_created
+        (7, 4, UINT32),   # unknown (invalid on the watch)
+        (1, 2, UINT16),   # manufacturer
+        (2, 2, UINT16),   # product
+        (5, 2, UINT16),   # number (invalid on the watch)
+        (0, 1, ENUM),     # type
+    ])
+    m += _data_record(0, [serial_number, created, 0xFFFFFFFF, manufacturer, product_id, 0xFFFF, FILE_TYPE_SLEEP],
+                      "IIIHHHB")
+    m += _definition_record(1, MESG_NUM_FILE_CREATOR, [(0, 2, UINT16)])  # software_version
+    m += _data_record(1, [software_version], "H")
+    m += _device_info_messages(manufacturer, product_id, serial_number, created, software_version)
+    m += _definition_record(3, MESG_NUM_SLEEP_DATA_INFO, [
+        (253, 4, UINT32),  # timestamp
+        (2,   4, UINT32),  # local timestamp
+        (1,   2, UINT16),  # sample interval (s), 60 on the watch
+        (0,   1, UINT8),   # 2 on the watch
+        (3,   1, ENUM),    # 1 on the watch
+    ])
+    m += _data_record(3, [created, created + utc_offset_seconds, 60, 2, 1], "IIHBB")
+    m += _definition_record(4, MESG_NUM_EVENT, [
+        (253, 4, UINT32),  # timestamp
+        (3,   4, UINT32),  # data: local timestamp
+        (0,   1, ENUM),    # event (74 = sleep)
+        (1,   1, ENUM),    # event_type (0 start, 1 stop)
+    ])
+    m += _data_record(4, [start_ts, start_ts + utc_offset_seconds, EVENT_SLEEP, 0], "IIBB")
+    m += _data_record(4, [end_ts, end_ts + utc_offset_seconds, EVENT_SLEEP, 1], "IIBB")
+    m += _sleep_assessment_message(6, assessment)
+    m += _definition_record(5, MESG_NUM_SLEEP_LEVEL, [
+        (253, 4, UINT32),  # timestamp (end of the stage)
+        (0,   1, ENUM),    # sleep_level
+    ])
+    for ts, level in levels:
+        m += _data_record(5, [ts, level], "IB")
+
+    raw = _wrap_fit(m)
+    log.info("Built sleep FIT file: %d level record(s), %d bytes", len(levels), len(raw))
+    return raw

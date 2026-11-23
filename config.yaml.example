@@ -29,7 +29,17 @@ sync:
                         # (e.g. wiped by a later sync from the real watch)
   backfill_min_minutes: 10   # only backfill gaps at least this long
   backfill_max_attempts: 3   # per gap, then give up
+  backfill_settle_minutes: 90  # don't backfill the last uploads until Garmin has had time to show them
   hooks:
     # Optional shell commands (e.g. curl to healthchecks.io)
     on_success: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID"
     # on_failure: "curl -fsS -m 10 --retry 5 https://hc-ping.com/YOUR-UUID/fail"
+
+sleep:
+  enabled: false        # upload Fitbit sleep to Garmin (needs the googlehealth.sleep.readonly scope)
+  holdback_hours: 3     # wait this long after waking, so a night the watch recorded is seen first
+  max_wait_hours: 12    # upload even if Fitbit hasn't finished the night / its HRV by then
+  upload_days: 2        # upload nights that ended within this many days; raise once to backfill
+  min_minutes: 180      # ignore shorter sessions (naps)
+  calibration_days: 365 # how far back to look for watch nights to calibrate the sleep score
+  max_garmin_lookups: 60  # Garmin sleep lookups per run (the first scan of a year spreads over ~6 runs)

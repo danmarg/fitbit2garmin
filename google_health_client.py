@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -33,6 +33,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     "https://www.googleapis.com/auth/googlehealth.settings.readonly",
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
 ]
 SETTINGS_URL = "https://health.googleapis.com/v4/users/me/settings"
 PAGE_SIZE = 10000
@@ -243,6 +244,132 @@ class GoogleHealthClient:
                 continue
             out[_floor_minute(_parse_time(r["startTime"]))] = int(count)
         return out
+
+    def _list_points(self, data_type: str, filter_expr: str, page_size: int) -> list[dict]:
+        """GET users/me/dataTypes/{data_type}/dataPoints (list), following nextPageToken."""
+        params = {"filter": filter_expr, "pageSize": page_size}
+        points: list[dict] = []
+        while True:
+            resp = self.http.get(
+                f"{API_BASE}/{data_type}/dataPoints", headers=self._auth_headers(), params=params
+            )
+            if not resp.ok:
+                log.error("Google Health %s list failed: %d %s", data_type, resp.status_code, resp.text)
+                resp.raise_for_status()
+            body = resp.json()
+            points.extend(body.get("dataPoints", []))
+            if not body.get("nextPageToken"):
+                return points
+            params["pageToken"] = body["nextPageToken"]
+
+    # Stage names -> the four Garmin levels; CLASSIC logs use ASLEEP/RESTLESS.
+    _STAGE_ALIASES = {"ASLEEP": "LIGHT", "RESTLESS": "AWAKE"}
+
+    @classmethod
+    def parse_sleep_sessions(cls, data_points: list[dict], min_minutes: int = 0,
+                             platform: str | None = "FITBIT") -> list[dict]:
+        """
+        Turn `sleep` data points into
+        [{"id", "start", "end", "utc_offset_seconds", "stages": [{"start","end","type"}]}] (UTC, by end time).
+        Sessions shorter than `min_minutes` (naps) are dropped.
+
+        Only data points from `platform` are kept (None keeps all). Google Health also
+        holds sleep imported from Apple Health / Health Connect, which for this user
+        is Garmin's own sleep coming back through the phone; it must never be uploaded
+        to Garmin or used to calibrate against it.
+        """
+        out = []
+        for dp in data_points:
+            if platform and (dp.get("dataSource") or {}).get("platform") != platform:
+                continue
+            s = dp.get("sleep") or {}
+            interval = s.get("interval") or {}
+            if not interval.get("startTime") or not interval.get("endTime"):
+                continue
+            start, end = _parse_time(interval["startTime"]), _parse_time(interval["endTime"])
+            if (end - start) < timedelta(minutes=min_minutes):
+                continue
+            stages = []
+            for st in s.get("stages") or []:
+                if not st.get("startTime") or not st.get("endTime"):
+                    continue
+                kind = str(st.get("type", "")).upper()
+                stages.append({
+                    "start": _parse_time(st["startTime"]),
+                    "end": _parse_time(st["endTime"]),
+                    "type": cls._STAGE_ALIASES.get(kind, kind),
+                })
+            if not stages:
+                log.info("Sleep session %s has no stages; skipping.", dp.get("name"))
+                continue
+            offset = interval.get("endUtcOffset") or interval.get("startUtcOffset") or "0s"
+            meta = s.get("metadata") or {}
+            out.append({
+                "id": dp.get("name"),
+                "start": start,
+                "end": end,
+                # Fitbit keeps refining a night for hours after waking; upload only once it is done.
+                "processed": bool(meta.get("processed", True)) and meta.get("stagesStatus", "SUCCEEDED") == "SUCCEEDED",
+                "utc_offset_seconds": int(float(str(offset).rstrip("s"))),
+                "stages": sorted(stages, key=lambda x: x["start"]),
+            })
+        return sorted(out, key=lambda x: x["end"])
+
+    def get_sleep_sessions(self, since: datetime, min_minutes: int = 180,
+                           platform: str | None = "FITBIT") -> list[dict]:
+        """Sleep sessions from `platform` that ended at or after `since`."""
+        points = self._list_points(
+            "sleep", f'sleep.interval.end_time >= "{since.strftime("%Y-%m-%dT%H:%M:%SZ")}"', page_size=25
+        )
+        sessions = self.parse_sleep_sessions(points, min_minutes=min_minutes, platform=platform)
+        log.info("Google Health sleep: %d session(s) since %s", len(sessions), f"{since:%Y-%m-%d %H:%M}")
+        return sessions
+
+    def get_daily_hrv(self, since: date, platform: str = "FITBIT") -> dict[str, float]:
+        """
+        Nightly HRV (average RMSSD, ms) by date, from `platform`, for dates >= `since`.
+        The list comes newest first; paging stops once a page is entirely older than `since`.
+        """
+        params = {"pageSize": 1000}
+        out: dict[str, float] = {}
+        while True:
+            resp = self.http.get(f"{API_BASE}/daily-heart-rate-variability/dataPoints",
+                                 headers=self._auth_headers(), params=params)
+            if not resp.ok:
+                log.error("Google Health daily HRV list failed: %d %s", resp.status_code, resp.text)
+                resp.raise_for_status()
+            body = resp.json()
+            dates = []
+            for dp in body.get("dataPoints", []):
+                v = dp.get("dailyHeartRateVariability") or {}
+                d = v.get("date") or {}
+                if not d.get("year"):
+                    continue
+                day = date(d["year"], d["month"], d["day"])
+                dates.append(day)
+                ms = v.get("averageHeartRateVariabilityMilliseconds")
+                if (dp.get("dataSource") or {}).get("platform") == platform and ms and day >= since:
+                    out[day.isoformat()] = float(ms)
+            if not body.get("nextPageToken") or (dates and max(dates) < since):
+                return out
+            params["pageToken"] = body["nextPageToken"]
+
+    def get_sleeping_heart_rate(self, start: datetime, end: datetime, platform: str = "FITBIT") -> float | None:
+        """
+        Average heart rate from `platform` over a sleep session (None if no readings).
+        Raw samples, not :rollUp, which merges every source, including the Garmin
+        watch's heart rate relayed through the phone.
+        """
+        ts = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        points = self._list_points(
+            "heart-rate",
+            f'heart_rate.sample_time.physical_time >= "{ts(start)}" AND heart_rate.sample_time.physical_time < "{ts(end)}"',
+            page_size=5000,
+        )
+        values = [float((p.get("heartRate") or {}).get("beatsPerMinute") or 0) for p in points
+                  if (p.get("dataSource") or {}).get("platform") == platform]
+        values = [v for v in values if v > 0]
+        return sum(values) / len(values) if values else None
 
     def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:
         """
