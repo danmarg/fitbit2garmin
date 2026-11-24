@@ -55,7 +55,7 @@ SLEEP_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "data"), "sleep.json
 class SleepStore:
     def __init__(self, path: str = SLEEP_FILE):
         self.path = path
-        self.data = {"seen": {}, "uploaded": {}, "garmin_nights": {}, "pairs": {}, "weights": None,
+        self.data = {"seen": {}, "uploaded": {}, "uploaded_end": {}, "garmin_nights": {}, "pairs": {}, "weights": None,
                      "stress_weights": None, "need": None, "needs": {}, "failures": {}, "bootstrapped": False}
         try:
             with open(path) as f:
@@ -173,28 +173,45 @@ def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minu
                        min_asleep: float = MERGE_MIN_ASLEEP) -> list[dict]:
     """
     Join sessions less than `max_gap` apart into one night: Fitbit splits a night with a
-    long wake-up (or time off the wrist) into separate sessions. Both parts must have at
-    least `min_asleep` minutes asleep, so a nap before bed or after waking stays separate.
-    The gap is written as AWAKE (the FIT encoder treats any gap that way regardless).
-    Overlapping stages of the later part are clipped so no time counts twice.
+    long wake-up (or time off the wrist) into separate sessions. Only parts with at least
+    `min_asleep` minutes asleep are joined, so a nap before bed or after waking stays
+    separate; shorter fragments lying between joined parts are taken in too. Gaps are
+    written as AWAKE (the FIT encoder treats any gap that way regardless), and each part's
+    stages are clipped to its own interval after the previous part, so no time counts twice.
     """
-    merged: list[dict] = []
-    for x in sorted(sessions, key=lambda x: x["start"]):
-        prev = merged[-1] if merged else None
-        if (prev is not None and x["start"] - prev["end"] < max_gap
-                and asleep_minutes(prev) >= min_asleep and asleep_minutes(x) >= min_asleep):
-            cut = prev["end"]
-            later = [{**st, "start": max(st["start"], cut)} for st in x["stages"] if st["end"] > cut]
-            gap = [{"start": cut, "end": x["start"], "type": "AWAKE"}] if x["start"] > cut else []
-            last = x if x["end"] >= prev["end"] else prev
-            merged[-1] = {**prev, "end": max(prev["end"], x["end"]),
-                          "stages": prev["stages"] + gap + later,
-                          "parts": parts(prev) + ([(max(x["start"], cut), x["end"])] if x["end"] > cut else []),
-                          "processed": prev.get("processed", True) and x.get("processed", True),
-                          "utc_offset_seconds": last["utc_offset_seconds"]}
+    ordered = sorted(sessions, key=lambda x: x["start"])
+    long_ = [x for x in ordered if asleep_minutes(x) >= min_asleep]
+    groups: list[list[dict]] = []
+    for x in long_:
+        if groups and x["start"] - max(p["end"] for p in groups[-1]) < max_gap:
+            groups[-1].append(x)
         else:
-            merged.append(dict(x))
-    return merged
+            groups.append([x])
+    out = [x for x in ordered if asleep_minutes(x) < min_asleep]
+    for group in groups:
+        if len(group) == 1:
+            out.append(dict(group[0]))
+            continue
+        lo, hi = group[0]["start"], max(p["end"] for p in group)
+        inside = [x for x in out if lo <= x["start"] and x["end"] <= hi]
+        out = [x for x in out if not any(x is y for y in inside)]
+        members = sorted(group + inside, key=lambda x: x["start"])
+        stages, spans, cut = [], [], None
+        for x in members:
+            a = x["start"] if cut is None else max(x["start"], cut)
+            if x["end"] <= a:
+                continue  # entirely inside an earlier part
+            if cut is not None and a > cut:
+                stages.append({"start": cut, "end": a, "type": "AWAKE"})
+            stages += [{**st, "start": max(st["start"], a), "end": min(st["end"], x["end"])}
+                       for st in x["stages"] if st["end"] > a and st["start"] < x["end"]]
+            spans.append((a, x["end"]))
+            cut = x["end"]
+        last = max(members, key=lambda x: x["end"])
+        out.append({**group[0], "end": hi, "stages": stages, "parts": spans,
+                    "processed": all(x.get("processed", True) for x in members),
+                    "utc_offset_seconds": last["utc_offset_seconds"]})
+    return sorted(out, key=lambda x: x["start"])
 
 
 def sleeping_heart_rate(health, session: dict) -> float | None:
@@ -209,11 +226,11 @@ def sleeping_heart_rate(health, session: dict) -> float | None:
 
 
 def main_sessions(sessions: list[dict]) -> dict[str, dict]:
-    """The longest session per wake date (split nights are merged and naps dropped first)."""
+    """The longest session per wake date by recorded time (split nights merged, naps dropped first)."""
     best: dict[str, dict] = {}
     for s in sessions:
         d = wake_date(s)
-        if d not in best or (s["end"] - s["start"]) > (best[d]["end"] - best[d]["start"]):
+        if d not in best or recorded_minutes(s) > recorded_minutes(best[d]):
             best[d] = s
     return best
 
@@ -270,7 +287,9 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
             return
         raise
     sessions = [s for s in merge_split_nights(sessions) if recorded_minutes(s) >= scfg.get("min_minutes", 180)]
-    nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
+    first = (now - timedelta(days=window_days)).date()
+    nights = {d: s for d, s in main_sessions([s for s in sessions if s["end"] <= now - holdback]).items()
+              if d >= first.isoformat()}
     try:
         hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())
     except Exception as e:
@@ -286,9 +305,13 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     provisional_from = (local_today - timedelta(days=1)).isoformat()
     # Every date in the window (watch nights matter even without a Fitbit night).
     # "none" Fitbit nights become eligible again if upload_days is raised to cover them.
-    first = (now - timedelta(days=window_days)).date()
     dates = {(first + timedelta(days=i)).isoformat() for i in range((local_today - first).days + 1)} | set(nights)
-    pending = sorted((d for d in dates if d not in seen
+    # A night uploaded before its later part arrived (Fitbit lists a part only once it
+    # ends) is uploaded again whole; Garmin replaces the night it showed for that date.
+    ends = store.data.setdefault("uploaded_end", {})
+    grown = {d for d, s in nights.items() if d in ends and s["end"] >= recent
+             and s["end"] > datetime.fromisoformat(ends[d]) + timedelta(minutes=5)}
+    pending = sorted((d for d in dates if d not in seen or d in grown
                       or (seen[d] == "none" and d in nights and nights[d]["end"] >= recent)), reverse=True)
 
     lookups = 0
@@ -316,7 +339,10 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         if g:
             store.remember_need(d, g.get("need"))
             store.remember_need(_next_day(d), g.get("next_need"))
-        if g is None:
+        if d in grown:
+            log.info("Sleep for %s: Fitbit added a later part of the night — uploading it again whole.", d)
+            to_upload.append(d)
+        elif g is None:
             if s is None:
                 if d < provisional_from:
                     seen[d] = "none"
@@ -408,6 +434,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         # accepts but doesn't show must not be uploaded again every hour.
         log.info("Sleep upload complete: %s", result)
         store.data["uploaded"][d] = s["start"].isoformat()
+        store.data["uploaded_end"][d] = s["end"].isoformat()
         seen[d] = "uploaded"
         store.data["failures"].pop(d, None)
         store.save()

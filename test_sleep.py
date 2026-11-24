@@ -11,7 +11,7 @@ import fitparse
 import sleep_score
 from fit_engine import build_sleep_fit, to_garmin_ts, _sleep_level_records
 from google_health_client import GoogleHealthClient
-from sleep_sync import SleepStore, asleep_minutes, merge_split_nights, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
+from sleep_sync import SleepStore, asleep_minutes, main_sessions, merge_split_nights, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
 
 T = datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc)
 
@@ -265,6 +265,39 @@ class TestRunSleepSync(unittest.TestCase):
         h = HR()
         self.assertEqual(sleeping_heart_rate(h, night), 55.0)
         self.assertEqual(h.calls, [(first["start"], first["end"]), (second["start"], second["end"])])
+
+    def test_short_fragment_between_halves_is_taken_in(self):
+        a = session(hours=3)                                      # 21:00-00:00
+        f0 = T + timedelta(hours=3.5)                             # 00:30-01:00
+        frag = {**session(f0, hours=1), "end": f0 + timedelta(minutes=30), "stages": [stage(0, 30, "LIGHT", f0)]}
+        c = session(T + timedelta(hours=4.5), hours=3)            # 01:30-04:30
+        merged = merge_split_nights([a, frag, c])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(recorded_minutes(merged[0]), 180 + 30 + 180)
+        stages = merged[0]["stages"]
+        self.assertTrue(all(x["end"] <= y["start"] for x, y in zip(stages, stages[1:])))
+
+    def test_main_session_is_chosen_by_recorded_time(self):
+        split = merge_split_nights([session(hours=2), session(T + timedelta(hours=4.4), hours=2)])[0]
+        whole = session(T + timedelta(hours=0.5), hours=6, offset=3600)
+        self.assertEqual(main_sessions([split, whole])[wake_date(whole)]["start"], whole["start"])
+
+    def test_night_uploaded_before_its_second_half_is_uploaded_again(self):
+        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)
+        d = wake_date(second)
+        h, g = FakeHealth([first], hrv={wake_date(first): 30, d: 30}), FakeGarmin()
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "holdback_hours": 3}}
+        run_sleep_sync(cfg, h, g, self.store, now=first["end"] + timedelta(hours=3, minutes=10))
+        self.assertEqual(len(g.uploads), 1)
+        g.nights[wake_date(first)] = {"start": first["start"], "end": first["end"], "score": 45, "need": 470,
+                                      "asleep": 200.0, "hr": 60}
+        h.sessions = [first, second]
+        later = second["end"] + timedelta(hours=3, minutes=10)
+        run_sleep_sync(cfg, h, g, self.store, now=later)
+        self.assertEqual(len(g.uploads), 2)
+        self.assertEqual(self.store.data["uploaded_end"][d], second["end"].isoformat())
+        run_sleep_sync(cfg, h, g, self.store, now=later + timedelta(hours=1))
+        self.assertEqual(len(g.uploads), 2)
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])
