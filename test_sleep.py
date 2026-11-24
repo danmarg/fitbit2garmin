@@ -11,7 +11,7 @@ import fitparse
 import sleep_score
 from fit_engine import build_sleep_fit, to_garmin_ts, _sleep_level_records
 from google_health_client import GoogleHealthClient
-from sleep_sync import SleepStore, asleep_minutes, merge_split_nights, run_sleep_sync, stage_minutes, wake_date
+from sleep_sync import SleepStore, asleep_minutes, merge_split_nights, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
 
 T = datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc)
 
@@ -235,6 +235,36 @@ class TestRunSleepSync(unittest.TestCase):
         now = second["end"] + timedelta(hours=4)
         run_sleep_sync(CFG, FakeHealth([first, second, nap], hrv={wake_date(second): 30}), g, self.store, now=now)
         self.assertEqual([start for start, _ in g.uploads], [first["start"]])
+
+    def test_naps_near_the_night_stay_separate(self):
+        night = session(hours=8)                                  # 21:00-05:00
+        nap = session(T + timedelta(hours=9), hours=0.75)         # 06:00-06:45, 1h later
+        self.assertEqual(len(merge_split_nights([night, nap])), 2)
+        # Two short naps 2h apart don't add up to a night either.
+        a, b = session(T, hours=0.75), session(T + timedelta(hours=2.75), hours=0.75)
+        self.assertEqual(len(merge_split_nights([a, b])), 2)
+
+    def test_overlapping_sessions_are_not_counted_twice(self):
+        whole = session(hours=8)
+        inner = session(T + timedelta(hours=2), hours=4)
+        merged = merge_split_nights([whole, inner])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(asleep_minutes(merged[0]), asleep_minutes(whole))
+        self.assertEqual(recorded_minutes(merged[0]), 480)
+
+    def test_heart_rate_and_length_leave_out_the_gap(self):
+        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)
+        night = merge_split_nights([first, second])[0]
+        self.assertEqual(recorded_minutes(night), 420)
+
+        class HR:
+            calls = []
+            def get_sleeping_heart_rate(self, a, b):
+                self.calls.append((a, b))
+                return 50.0 if a == first["start"] else 60.0
+        h = HR()
+        self.assertEqual(sleeping_heart_rate(h, night), 55.0)
+        self.assertEqual(h.calls, [(first["start"], first["end"]), (second["start"], second["end"])])
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])

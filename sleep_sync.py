@@ -155,23 +155,57 @@ def asleep_minutes(session: dict) -> float:
     return sum(m.get(k, 0) for k in ("DEEP", "LIGHT", "REM"))
 
 
-def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(hours=3)) -> list[dict]:
+MERGE_GAP_MINUTES = 150    # join parts of a night less than this far apart
+MERGE_MIN_ASLEEP = 60      # a part shorter than this (minutes asleep) is a nap, never joined
+
+
+def parts(session: dict) -> list[tuple[datetime, datetime]]:
+    """The recorded intervals of a session (several once split parts are joined)."""
+    return session.get("parts") or [(session["start"], session["end"])]
+
+
+def recorded_minutes(session: dict) -> float:
+    """Time Fitbit recorded, leaving out the gaps between joined parts."""
+    return sum((b - a).total_seconds() for a, b in parts(session)) / 60
+
+
+def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minutes=MERGE_GAP_MINUTES),
+                       min_asleep: float = MERGE_MIN_ASLEEP) -> list[dict]:
     """
-    Join sessions less than `max_gap` apart into one night, the gap as AWAKE: Fitbit
-    splits a night with a long wake-up (or time off the wrist) into separate sessions.
+    Join sessions less than `max_gap` apart into one night: Fitbit splits a night with a
+    long wake-up (or time off the wrist) into separate sessions. Both parts must have at
+    least `min_asleep` minutes asleep, so a nap before bed or after waking stays separate.
+    The gap is written as AWAKE (the FIT encoder treats any gap that way regardless).
+    Overlapping stages of the later part are clipped so no time counts twice.
     """
     merged: list[dict] = []
     for x in sorted(sessions, key=lambda x: x["start"]):
         prev = merged[-1] if merged else None
-        if prev is not None and x["start"] - prev["end"] < max_gap:
-            gap = [{"start": prev["end"], "end": x["start"], "type": "AWAKE"}] if x["start"] > prev["end"] else []
+        if (prev is not None and x["start"] - prev["end"] < max_gap
+                and asleep_minutes(prev) >= min_asleep and asleep_minutes(x) >= min_asleep):
+            cut = prev["end"]
+            later = [{**st, "start": max(st["start"], cut)} for st in x["stages"] if st["end"] > cut]
+            gap = [{"start": cut, "end": x["start"], "type": "AWAKE"}] if x["start"] > cut else []
+            last = x if x["end"] >= prev["end"] else prev
             merged[-1] = {**prev, "end": max(prev["end"], x["end"]),
-                          "stages": prev["stages"] + gap + x["stages"],
+                          "stages": prev["stages"] + gap + later,
+                          "parts": parts(prev) + ([(max(x["start"], cut), x["end"])] if x["end"] > cut else []),
                           "processed": prev.get("processed", True) and x.get("processed", True),
-                          "utc_offset_seconds": x["utc_offset_seconds"]}
+                          "utc_offset_seconds": last["utc_offset_seconds"]}
         else:
             merged.append(dict(x))
     return merged
+
+
+def sleeping_heart_rate(health, session: dict) -> float | None:
+    """Average Fitbit heart rate over the recorded parts (not the gaps between them)."""
+    total = weight = 0.0
+    for a, b in parts(session):
+        hr = health.get_sleeping_heart_rate(a, b)
+        if hr is not None:
+            w = (b - a).total_seconds()
+            total, weight = total + hr * w, weight + w
+    return total / weight if weight else None
 
 
 def main_sessions(sessions: list[dict]) -> dict[str, dict]:
@@ -225,7 +259,9 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     window_days = calibration_days if not store.data["bootstrapped"] else max(upload_days, 3)
     try:
         # Fetch every session: halves of a split night may each be shorter than min_minutes.
-        sessions = health.get_sleep_sessions(now - timedelta(days=window_days), min_minutes=0)
+        # The margin catches the first part of a split night ending just before the window.
+        sessions = health.get_sleep_sessions(now - timedelta(days=window_days, minutes=MERGE_GAP_MINUTES),
+                                             min_minutes=0)
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
             log.error("Google Health refused the sleep data (%s). The token may lack the "
@@ -233,8 +269,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                       "Skipping sleep this run.", e.response.status_code)
             return
         raise
-    min_span = timedelta(minutes=scfg.get("min_minutes", 180))
-    sessions = [s for s in merge_split_nights(sessions) if s["end"] - s["start"] >= min_span]
+    sessions = [s for s in merge_split_nights(sessions) if recorded_minutes(s) >= scfg.get("min_minutes", 180)]
     nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
     try:
         hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())
@@ -304,7 +339,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                 learned = True
             if s is not None:
                 try:
-                    hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+                    hr = sleeping_heart_rate(health, s)
                 except Exception as e:
                     complete = False
                     store.fail(d, f"Fitbit heart rate unavailable ({e})")
@@ -345,7 +380,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
             store.remember_need(d, prev.get("next_need"))
         need = store.need_for(d)
         try:
-            hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+            hr = sleeping_heart_rate(health, s)
         except Exception as e:
             store.fail(d, f"Fitbit heart rate unavailable ({e})")
             store.save()
