@@ -297,32 +297,35 @@ class TestRunSleepSync(unittest.TestCase):
                        now=first["end"] + timedelta(hours=12, minutes=10))
         self.assertEqual(len(g2.uploads), 1)
 
-    def test_night_uploaded_before_its_second_half_is_uploaded_again(self):
-        t0 = T + timedelta(hours=6)                               # 03:00-06:30 UTC, wake 07:30 local
-        first, second = session(t0, hours=3.5), session(t0 + timedelta(hours=5.5), hours=3.5)
-        d = wake_date(second)
-        h, g = FakeHealth([first], hrv={wake_date(first): 30, d: 30}), FakeGarmin()
-        cfg = {**CFG, "sleep": {**CFG["sleep"], "holdback_hours": 3}}
-        run_sleep_sync(cfg, h, g, self.store, now=first["end"] + timedelta(hours=3, minutes=10))
+    def test_naps_of_an_hour_or_more_stay_off_the_night(self):
+        def nap(t, minutes):
+            return {**session(t, hours=1), "end": t + timedelta(minutes=minutes), "stages": [stage(0, minutes, "LIGHT", t)]}
+        # 17:00-18:30 local nap, bed 20:30-05:30 local (UTC+1): gap centred at 19:30 local.
+        evening = nap(T - timedelta(hours=4), 90)
+        night = session(T - timedelta(hours=0.5), hours=9)
+        morning = nap(night["end"] + timedelta(hours=1.5), 90)     # 07:00 local
+        self.assertEqual(len(merge_split_nights([evening, night, morning])), 3)
+
+    def test_fragments_are_not_matched_against_merged_nights(self):
+        # Two separate split nights a day apart, each with a fragment in its gap.
+        n1 = [session(hours=3), session(T + timedelta(hours=5), hours=3)]
+        t2 = T + timedelta(days=1)
+        n2 = [session(t2, hours=3), session(t2 + timedelta(hours=5), hours=3)]
+        frag = {**session(T + timedelta(hours=3.5), hours=1), "end": T + timedelta(hours=4),
+                "stages": [stage(0, 30, "LIGHT", T + timedelta(hours=3.5))]}
+        merged = merge_split_nights(n1 + n2 + [frag])
+        self.assertEqual(len(merged), 2)
+        self.assertEqual([len(m["parts"]) for m in merged], [3, 2])
+
+    def test_small_hours_wait_ends_at_ten(self):
+        first = session(hours=3.5)                                  # wakes 01:30 local
+        h = FakeHealth([first], hrv={wake_date(first): 30})
+        g = FakeGarmin()
+        nine = datetime(2026, 11, 22, 8, 0, tzinfo=timezone.utc)    # 09:00 local
+        run_sleep_sync(CFG, h, g, self.store, now=nine)
+        self.assertEqual(g.uploads, [])
+        run_sleep_sync(CFG, h, g, self.store, now=nine + timedelta(hours=1, minutes=5))
         self.assertEqual(len(g.uploads), 1)
-        g.nights[wake_date(first)] = {"start": first["start"], "end": first["end"], "score": 45, "need": 470,
-                                      "asleep": 200.0, "hr": 60}
-        h.sessions = [first, second]
-        later = second["end"] + timedelta(hours=3, minutes=10)
-        run_sleep_sync(cfg, h, g, self.store, now=later)
-        self.assertEqual(len(g.uploads), 2)
-        self.assertEqual(self.store.data["uploaded_end"][d], second["end"].isoformat())
-        run_sleep_sync(cfg, h, g, self.store, now=later + timedelta(hours=1))
-        self.assertEqual(len(g.uploads), 2)
-        # A watch night Garmin holds for the date is never replaced by a grown night.
-        other = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
-        g3, h3 = FakeGarmin(), FakeHealth([first], hrv={d: 30})
-        run_sleep_sync(cfg, h3, g3, other, now=first["end"] + timedelta(hours=3, minutes=10))
-        g3.nights[d] = {"start": first["start"] - timedelta(hours=1), "end": second["end"], "score": 80,
-                        "need": 470, "asleep": 420.0, "hr": 55}
-        h3.sessions = [first, second]
-        run_sleep_sync(cfg, h3, g3, other, now=later)
-        self.assertEqual(len(g3.uploads), 1)
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])

@@ -27,8 +27,6 @@ the initial scan also record what the models predicted before refitting
 The store (sleep.json in the state directory) holds:
   seen:          {date: "uploaded" | "watch" | "ours" | "none" | "failed"}
   uploaded:      {date: fitbit start ISO}
-  uploaded_end:  {date: fitbit end ISO of the last upload}; a night that later ends
-                 further on (Fitbit added a later part) is uploaded again whole
   garmin_nights: {date: {"asleep", "need", "hr", "score"}}
   pairs:         {date: {"asleep", "need", "hr", "hrv", "score", "stress", ["pred_score", "pred_stress"]}}
   weights / stress_weights: the learned models (None until nights are found)
@@ -57,7 +55,7 @@ SLEEP_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "data"), "sleep.json
 class SleepStore:
     def __init__(self, path: str = SLEEP_FILE):
         self.path = path
-        self.data = {"seen": {}, "uploaded": {}, "uploaded_end": {}, "garmin_nights": {}, "pairs": {}, "weights": None,
+        self.data = {"seen": {}, "uploaded": {}, "garmin_nights": {}, "pairs": {}, "weights": None,
                      "stress_weights": None, "need": None, "needs": {}, "failures": {}, "bootstrapped": False}
         try:
             with open(path) as f:
@@ -177,7 +175,9 @@ def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minu
     Join sessions less than `max_gap` apart into one night: Fitbit splits a night with a
     long wake-up (or time off the wrist) into separate sessions. Only parts with at least
     `min_asleep` minutes asleep are joined, so a nap before bed or after waking stays
-    separate; shorter fragments lying between joined parts are taken in too. Gaps are
+    separate, and only across a gap centred in the night (23:00-05:00 local), so an evening
+    nap before bed or a morning one after waking isn't joined to the night. Shorter
+    fragments overlapping a joined night are taken in too. Gaps are
     written as AWAKE (the FIT encoder treats any gap that way regardless), and each part's
     stages are clipped to its own interval after the previous part, so no time counts twice.
     """
@@ -185,19 +185,21 @@ def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minu
     long_ = [x for x in ordered if asleep_minutes(x) >= min_asleep]
     groups: list[list[dict]] = []
     for x in long_:
-        if groups and x["start"] - max(p["end"] for p in groups[-1]) < max_gap:
+        prev_end = max(p["end"] for p in groups[-1]) if groups else None
+        if prev_end is not None and x["start"] - prev_end < max_gap and _night_gap(prev_end, x):
             groups[-1].append(x)
         else:
             groups.append([x])
-    out = [x for x in ordered if asleep_minutes(x) < min_asleep]
+    short = [x for x in ordered if asleep_minutes(x) < min_asleep]
+    out = []
     for group in groups:
         if len(group) == 1:
             out.append(dict(group[0]))
             continue
         lo, hi = group[0]["start"], max(p["end"] for p in group)
         # Short fragments overlapping the joined window are taken in (and may extend it).
-        inside = [x for x in out if x["end"] > lo and x["start"] < hi]
-        out = [x for x in out if not any(x is y for y in inside)]
+        inside = [x for x in short if x["end"] > lo and x["start"] < hi]
+        short = [x for x in short if not any(x is y for y in inside)]
         members = sorted(group + inside, key=lambda x: x["start"])
         stages, spans, cut = [], [], None
         for x in members:
@@ -214,17 +216,29 @@ def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minu
         out.append({**group[0], "start": members[0]["start"], "end": max(hi, last["end"]), "stages": stages, "parts": spans,
                     "processed": all(x.get("processed", True) for x in members),
                     "utc_offset_seconds": last["utc_offset_seconds"]})
-    return sorted(out, key=lambda x: x["start"])
+    return sorted(out + short, key=lambda x: x["start"])
 
 
-def may_continue(session: dict) -> bool:
+def _night_gap(prev_end: datetime, x: dict) -> bool:
+    """Whether the gap between two parts is centred in the night (23:00-05:00 local)."""
+    mid = prev_end + (x["start"] - prev_end) / 2 + timedelta(seconds=x["utc_offset_seconds"])
+    return mid.hour >= 23 or mid.hour < 5
+
+
+def may_continue(session: dict, now: datetime) -> bool:
     """
-    Woke in the evening or the middle of the night (18:00-04:00 local), so Fitbit may yet
-    list a later part of the night; uploading now could put half the night on this date
-    and the joined night on the next.
+    Whether Fitbit may still list a later part that would join this night (Fitbit lists a
+    part only once it ends). Uploading now could put half the night on Garmin, or on the
+    wrong date. A part can only join across a night-centred gap under MERGE_GAP_MINUTES,
+    so only nights ending 21:45-05:00 local wait; they wait until 10:00 local at most.
     """
-    hour = (session["end"] + timedelta(seconds=session["utc_offset_seconds"])).hour
-    return hour >= 18 or hour < 4
+    local_end = session["end"] + timedelta(seconds=session["utc_offset_seconds"])
+    minutes = local_end.hour * 60 + local_end.minute
+    if not (minutes >= 23 * 60 - MERGE_GAP_MINUTES // 2 or minutes < 5 * 60):
+        return False
+    morning = datetime.combine((local_end + timedelta(hours=6)).date(), datetime.min.time().replace(hour=10),
+                               tzinfo=timezone.utc) - timedelta(seconds=session["utc_offset_seconds"])
+    return now < morning
 
 
 def sleeping_heart_rate(health, session: dict) -> float | None:
@@ -319,15 +333,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     # Every date in the window (watch nights matter even without a Fitbit night).
     # "none" Fitbit nights become eligible again if upload_days is raised to cover them.
     dates = {(first + timedelta(days=i)).isoformat() for i in range((local_today - first).days + 1)} | set(nights)
-    # A night uploaded before its later part arrived (Fitbit lists a part only once it
-    # ends) is uploaded again whole; Garmin replaces the night it showed for that date.
-    ends = store.data.setdefault("uploaded_end", {})
-    grown = {d for d, s in nights.items()
-             if d in ends and d in store.data["uploaded"] and s["end"] >= recent
-             and seen.get(d) != "failed" and store.data["failures"].get(d, 0) < MAX_FAILURES
-             and s["start"] <= datetime.fromisoformat(store.data["uploaded"][d]) + timedelta(seconds=1)
-             and s["end"] > datetime.fromisoformat(ends[d]) + timedelta(minutes=5)}
-    pending = sorted((d for d in dates if d not in seen or d in grown
+    pending = sorted((d for d in dates if d not in seen
                       or (seen[d] == "none" and d in nights and nights[d]["end"] >= recent)), reverse=True)
 
     lookups = 0
@@ -357,20 +363,8 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
             store.remember_need(_next_day(d), g.get("next_need"))
         ready = s is not None and (
             now - s["end"] >= max_wait
-            or (s.get("processed", True) and d in hrv_by_date and not may_continue(s)))
-        if d in grown:
-            up_start = datetime.fromisoformat(store.data["uploaded"][d])
-            up_end = datetime.fromisoformat(ends[d])
-            if g is not None and not (abs((g["start"] - up_start).total_seconds()) <= 1
-                                      and g["end"] <= up_end + timedelta(seconds=1)):
-                seen[d] = "watch"  # Garmin now holds another night for this date: leave it
-                ends.pop(d, None)
-            elif ready:
-                log.info("Sleep for %s: Fitbit added a later part of the night — uploading it again whole.", d)
-                to_upload.append(d)
-            else:
-                log.info("Sleep for %s: night grew; waiting for Fitbit to finish processing it.", d)
-        elif g is None:
+            or (s.get("processed", True) and d in hrv_by_date and not may_continue(s, now)))
+        if g is None:
             if s is None:
                 if d < provisional_from:
                     seen[d] = "none"
@@ -378,7 +372,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                 seen[d] = "none"
             elif ready:
                 to_upload.append(d)
-            elif may_continue(s) and s.get("processed", True) and d in hrv_by_date:
+            elif may_continue(s, now) and s.get("processed", True) and d in hrv_by_date:
                 log.info("Sleep for %s: woke at night; waiting in case Fitbit adds a later part.", d)
             else:
                 log.info("Sleep for %s: waiting for Fitbit to finish processing the night%s.", d,
@@ -464,7 +458,6 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         # accepts but doesn't show must not be uploaded again every hour.
         log.info("Sleep upload complete: %s", result)
         store.data["uploaded"][d] = s["start"].isoformat()
-        store.data["uploaded_end"][d] = s["end"].isoformat()
         seen[d] = "uploaded"
         store.data["failures"].pop(d, None)
         store.save()
