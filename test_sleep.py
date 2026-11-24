@@ -327,6 +327,17 @@ class TestRunSleepSync(unittest.TestCase):
         run_sleep_sync(CFG, h, g, self.store, now=nine + timedelta(hours=1, minutes=5))
         self.assertEqual(len(g.uploads), 1)
 
+    def test_night_overlapping_an_earlier_upload_is_not_uploaded_again(self):
+        first = session(T - timedelta(hours=3), hours=4)           # 19:00-23:00 local, wake date D-1
+        second = session(T + timedelta(hours=2.5), hours=7)        # 00:30-07:30 local, joins it
+        self.store.data["uploaded"][wake_date(first)] = first["start"].isoformat()
+        self.store.data["seen"][wake_date(first)] = "uploaded"
+        g = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([first, second], hrv={wake_date(second): 30}), g, self.store,
+                       now=second["end"] + timedelta(hours=4))
+        self.assertEqual(g.uploads, [])
+        self.assertEqual(self.store.data["seen"][wake_date(second)], "ours")
+
     def test_refreshes_google_token(self):
         h = FakeHealth([])
         run_sleep_sync(CFG, h, FakeGarmin(), self.store, now=self.now)

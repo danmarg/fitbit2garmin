@@ -364,7 +364,15 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         ready = s is not None and (
             now - s["end"] >= max_wait
             or (s.get("processed", True) and d in hrv_by_date and not may_continue(s, now)))
-        if g is None:
+        overlaps = s is not None and any(
+            o != d and s["start"] <= datetime.fromisoformat(start) < s["end"]
+            for o, start in store.data["uploaded"].items())
+        if g is None and overlaps:
+            # Part of this night already went up under another date (a split night whose first
+            # part ended before midnight); a second upload would overlap it on Garmin.
+            log.info("Sleep for %s: part of this night was already uploaded under another date — skipping.", d)
+            seen[d] = "ours"
+        elif g is None:
             if s is None:
                 if d < provisional_from:
                     seen[d] = "none"
