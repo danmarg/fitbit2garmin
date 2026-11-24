@@ -155,8 +155,27 @@ def asleep_minutes(session: dict) -> float:
     return sum(m.get(k, 0) for k in ("DEEP", "LIGHT", "REM"))
 
 
+def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(hours=3)) -> list[dict]:
+    """
+    Join sessions less than `max_gap` apart into one night, the gap as AWAKE: Fitbit
+    splits a night with a long wake-up (or time off the wrist) into separate sessions.
+    """
+    merged: list[dict] = []
+    for x in sorted(sessions, key=lambda x: x["start"]):
+        prev = merged[-1] if merged else None
+        if prev is not None and x["start"] - prev["end"] < max_gap:
+            gap = [{"start": prev["end"], "end": x["start"], "type": "AWAKE"}] if x["start"] > prev["end"] else []
+            merged[-1] = {**prev, "end": max(prev["end"], x["end"]),
+                          "stages": prev["stages"] + gap + x["stages"],
+                          "processed": prev.get("processed", True) and x.get("processed", True),
+                          "utc_offset_seconds": x["utc_offset_seconds"]}
+        else:
+            merged.append(dict(x))
+    return merged
+
+
 def main_sessions(sessions: list[dict]) -> dict[str, dict]:
-    """The longest session per wake date (naps are already dropped by min_minutes)."""
+    """The longest session per wake date (split nights are merged and naps dropped first)."""
     best: dict[str, dict] = {}
     for s in sessions:
         d = wake_date(s)
@@ -205,8 +224,8 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     # Scan the whole calibration window until it has been covered once, then only recent nights.
     window_days = calibration_days if not store.data["bootstrapped"] else max(upload_days, 3)
     try:
-        sessions = health.get_sleep_sessions(now - timedelta(days=window_days),
-                                             min_minutes=scfg.get("min_minutes", 180))
+        # Fetch every session: halves of a split night may each be shorter than min_minutes.
+        sessions = health.get_sleep_sessions(now - timedelta(days=window_days), min_minutes=0)
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
             log.error("Google Health refused the sleep data (%s). The token may lack the "
@@ -214,6 +233,8 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                       "Skipping sleep this run.", e.response.status_code)
             return
         raise
+    min_span = timedelta(minutes=scfg.get("min_minutes", 180))
+    sessions = [s for s in merge_split_nights(sessions) if s["end"] - s["start"] >= min_span]
     nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
     try:
         hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())

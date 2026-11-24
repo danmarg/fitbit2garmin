@@ -11,7 +11,7 @@ import fitparse
 import sleep_score
 from fit_engine import build_sleep_fit, to_garmin_ts, _sleep_level_records
 from google_health_client import GoogleHealthClient
-from sleep_sync import SleepStore, run_sleep_sync, wake_date
+from sleep_sync import SleepStore, asleep_minutes, merge_split_nights, run_sleep_sync, stage_minutes, wake_date
 
 T = datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc)
 
@@ -219,6 +219,22 @@ class TestRunSleepSync(unittest.TestCase):
         self.assertIn(d, saved["garmin_nights"])  # the run's work was saved
         self.assertNotIn(d, saved["pairs"])
         self.assertNotIn(d, saved["seen"])  # retried next run
+
+    def test_split_night_is_uploaded_whole(self):
+        # Fitbit split the night: 21:00-00:30, awake 2h, 02:30-06:00.
+        first = session(hours=3.5)
+        second = session(T + timedelta(hours=5.5), hours=3.5)
+        nap = session(T + timedelta(hours=16), hours=1)
+        merged = merge_split_nights([second, first, nap])
+        self.assertEqual(len(merged), 2)
+        night = merged[0]
+        self.assertEqual((night["start"], night["end"]), (first["start"], second["end"]))
+        self.assertEqual(stage_minutes(night)["AWAKE"], 10 + 120 + 10)
+        self.assertEqual(asleep_minutes(night), asleep_minutes(first) + asleep_minutes(second))
+        g = FakeGarmin()
+        now = second["end"] + timedelta(hours=4)
+        run_sleep_sync(CFG, FakeHealth([first, second, nap], hrv={wake_date(second): 30}), g, self.store, now=now)
+        self.assertEqual([start for start, _ in g.uploads], [first["start"]])
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])
