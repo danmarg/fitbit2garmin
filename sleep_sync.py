@@ -155,12 +155,109 @@ def asleep_minutes(session: dict) -> float:
     return sum(m.get(k, 0) for k in ("DEEP", "LIGHT", "REM"))
 
 
+MERGE_GAP_MINUTES = 150    # join parts of a night less than this far apart
+MERGE_MIN_ASLEEP = 60      # a part shorter than this (minutes asleep) is a nap, never joined
+
+
+def parts(session: dict) -> list[tuple[datetime, datetime]]:
+    """The recorded intervals of a session (several once split parts are joined)."""
+    return session.get("parts") or [(session["start"], session["end"])]
+
+
+def recorded_minutes(session: dict) -> float:
+    """Time Fitbit recorded, leaving out the gaps between joined parts."""
+    return sum((b - a).total_seconds() for a, b in parts(session)) / 60
+
+
+def merge_split_nights(sessions: list[dict], max_gap: timedelta = timedelta(minutes=MERGE_GAP_MINUTES),
+                       min_asleep: float = MERGE_MIN_ASLEEP) -> list[dict]:
+    """
+    Join sessions less than `max_gap` apart into one night: Fitbit splits a night with a
+    long wake-up (or time off the wrist) into separate sessions. Only parts with at least
+    `min_asleep` minutes asleep are joined, so a nap before bed or after waking stays
+    separate, and only across a gap centred in the night (23:00-05:00 local), so an evening
+    nap before bed or a morning one after waking isn't joined to the night. Shorter
+    fragments overlapping a joined night are taken in too. Gaps are
+    written as AWAKE (the FIT encoder treats any gap that way regardless), and each part's
+    stages are clipped to its own interval after the previous part, so no time counts twice.
+    """
+    ordered = sorted(sessions, key=lambda x: x["start"])
+    long_ = [x for x in ordered if asleep_minutes(x) >= min_asleep]
+    groups: list[list[dict]] = []
+    for x in long_:
+        prev_end = max(p["end"] for p in groups[-1]) if groups else None
+        if prev_end is not None and x["start"] - prev_end < max_gap and _night_gap(prev_end, x):
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    short = [x for x in ordered if asleep_minutes(x) < min_asleep]
+    out = []
+    for group in groups:
+        if len(group) == 1:
+            out.append(dict(group[0]))
+            continue
+        lo, hi = group[0]["start"], max(p["end"] for p in group)
+        # Short fragments overlapping the joined window are taken in (and may extend it).
+        inside = [x for x in short if x["end"] > lo and x["start"] < hi]
+        short = [x for x in short if not any(x is y for y in inside)]
+        members = sorted(group + inside, key=lambda x: x["start"])
+        stages, spans, cut = [], [], None
+        for x in members:
+            a = x["start"] if cut is None else max(x["start"], cut)
+            if x["end"] <= a:
+                continue  # entirely inside an earlier part
+            if cut is not None and a > cut:
+                stages.append({"start": cut, "end": a, "type": "AWAKE"})
+            stages += [{**st, "start": max(st["start"], a), "end": min(st["end"], x["end"])}
+                       for st in x["stages"] if st["end"] > a and st["start"] < x["end"]]
+            spans.append((a, x["end"]))
+            cut = x["end"]
+        last = max(members, key=lambda x: x["end"])
+        out.append({**group[0], "start": members[0]["start"], "end": max(hi, last["end"]), "stages": stages, "parts": spans,
+                    "processed": all(x.get("processed", True) for x in members),
+                    "utc_offset_seconds": last["utc_offset_seconds"]})
+    return sorted(out + short, key=lambda x: x["start"])
+
+
+def _night_gap(prev_end: datetime, x: dict) -> bool:
+    """Whether the gap between two parts is centred in the night (23:00-05:00 local)."""
+    mid = prev_end + (x["start"] - prev_end) / 2 + timedelta(seconds=x["utc_offset_seconds"])
+    return mid.hour >= 23 or mid.hour < 5
+
+
+def may_continue(session: dict, now: datetime) -> bool:
+    """
+    Whether Fitbit may still list a later part that would join this night (Fitbit lists a
+    part only once it ends). Uploading now could put half the night on Garmin, or on the
+    wrong date. A part can only join across a night-centred gap under MERGE_GAP_MINUTES,
+    so only nights ending 21:45-05:00 local wait; they wait until 10:00 local at most.
+    """
+    local_end = session["end"] + timedelta(seconds=session["utc_offset_seconds"])
+    minutes = local_end.hour * 60 + local_end.minute
+    if not (minutes >= 23 * 60 - MERGE_GAP_MINUTES // 2 or minutes < 5 * 60):
+        return False
+    morning = datetime.combine((local_end + timedelta(hours=6)).date(), datetime.min.time().replace(hour=10),
+                               tzinfo=timezone.utc) - timedelta(seconds=session["utc_offset_seconds"])
+    return now < morning
+
+
+def sleeping_heart_rate(health, session: dict) -> float | None:
+    """Average Fitbit heart rate over the recorded parts (not the gaps between them)."""
+    total = weight = 0.0
+    for a, b in parts(session):
+        hr = health.get_sleeping_heart_rate(a, b)
+        if hr is not None:
+            w = (b - a).total_seconds()
+            total, weight = total + hr * w, weight + w
+    return total / weight if weight else None
+
+
 def main_sessions(sessions: list[dict]) -> dict[str, dict]:
-    """The longest session per wake date (naps are already dropped by min_minutes)."""
+    """The longest session per wake date by recorded time (split nights merged, naps dropped first)."""
     best: dict[str, dict] = {}
     for s in sessions:
         d = wake_date(s)
-        if d not in best or (s["end"] - s["start"]) > (best[d]["end"] - best[d]["start"]):
+        if d not in best or recorded_minutes(s) > recorded_minutes(best[d]):
             best[d] = s
     return best
 
@@ -205,8 +302,10 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     # Scan the whole calibration window until it has been covered once, then only recent nights.
     window_days = calibration_days if not store.data["bootstrapped"] else max(upload_days, 3)
     try:
-        sessions = health.get_sleep_sessions(now - timedelta(days=window_days),
-                                             min_minutes=scfg.get("min_minutes", 180))
+        # Fetch every session: halves of a split night may each be shorter than min_minutes.
+        # The margin catches the first part of a split night ending just before the window.
+        sessions = health.get_sleep_sessions(now - timedelta(days=window_days, minutes=MERGE_GAP_MINUTES),
+                                             min_minutes=0)
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
             log.error("Google Health refused the sleep data (%s). The token may lack the "
@@ -214,7 +313,10 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                       "Skipping sleep this run.", e.response.status_code)
             return
         raise
-    nights = main_sessions([s for s in sessions if s["end"] <= now - holdback])
+    sessions = [s for s in merge_split_nights(sessions) if recorded_minutes(s) >= scfg.get("min_minutes", 180)]
+    first = (now - timedelta(days=window_days)).date()
+    nights = {d: s for d, s in main_sessions([s for s in sessions if s["end"] <= now - holdback]).items()
+              if d >= first.isoformat()}
     try:
         hrv_by_date = health.get_daily_hrv((now - timedelta(days=window_days + 1)).date())
     except Exception as e:
@@ -230,7 +332,6 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
     provisional_from = (local_today - timedelta(days=1)).isoformat()
     # Every date in the window (watch nights matter even without a Fitbit night).
     # "none" Fitbit nights become eligible again if upload_days is raised to cover them.
-    first = (now - timedelta(days=window_days)).date()
     dates = {(first + timedelta(days=i)).isoformat() for i in range((local_today - first).days + 1)} | set(nights)
     pending = sorted((d for d in dates if d not in seen
                       or (seen[d] == "none" and d in nights and nights[d]["end"] >= recent)), reverse=True)
@@ -260,14 +361,27 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
         if g:
             store.remember_need(d, g.get("need"))
             store.remember_need(_next_day(d), g.get("next_need"))
-        if g is None:
+        ready = s is not None and (
+            now - s["end"] >= max_wait
+            or (s.get("processed", True) and d in hrv_by_date and not may_continue(s, now)))
+        overlaps = s is not None and any(
+            o != d and s["start"] <= datetime.fromisoformat(start) < s["end"]
+            for o, start in store.data["uploaded"].items())
+        if g is None and overlaps:
+            # Part of this night already went up under another date (a split night whose first
+            # part ended before midnight); a second upload would overlap it on Garmin.
+            log.info("Sleep for %s: part of this night was already uploaded under another date — skipping.", d)
+            seen[d] = "ours"
+        elif g is None:
             if s is None:
                 if d < provisional_from:
                     seen[d] = "none"
             elif s["end"] < recent:
                 seen[d] = "none"
-            elif (s.get("processed", True) and d in hrv_by_date) or now - s["end"] >= max_wait:
+            elif ready:
                 to_upload.append(d)
+            elif may_continue(s, now) and s.get("processed", True) and d in hrv_by_date:
+                log.info("Sleep for %s: woke at night; waiting in case Fitbit adds a later part.", d)
             else:
                 log.info("Sleep for %s: waiting for Fitbit to finish processing the night%s.", d,
                          "" if d in hrv_by_date else " and its HRV")
@@ -283,7 +397,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                 learned = True
             if s is not None:
                 try:
-                    hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+                    hr = sleeping_heart_rate(health, s)
                 except Exception as e:
                     complete = False
                     store.fail(d, f"Fitbit heart rate unavailable ({e})")
@@ -324,7 +438,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
             store.remember_need(d, prev.get("next_need"))
         need = store.need_for(d)
         try:
-            hr = health.get_sleeping_heart_rate(s["start"], s["end"])
+            hr = sleeping_heart_rate(health, s)
         except Exception as e:
             store.fail(d, f"Fitbit heart rate unavailable ({e})")
             store.save()

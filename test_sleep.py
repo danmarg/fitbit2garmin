@@ -11,7 +11,7 @@ import fitparse
 import sleep_score
 from fit_engine import build_sleep_fit, to_garmin_ts, _sleep_level_records
 from google_health_client import GoogleHealthClient
-from sleep_sync import SleepStore, run_sleep_sync, wake_date
+from sleep_sync import SleepStore, asleep_minutes, main_sessions, merge_split_nights, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
 
 T = datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc)
 
@@ -219,6 +219,124 @@ class TestRunSleepSync(unittest.TestCase):
         self.assertIn(d, saved["garmin_nights"])  # the run's work was saved
         self.assertNotIn(d, saved["pairs"])
         self.assertNotIn(d, saved["seen"])  # retried next run
+
+    def test_split_night_is_uploaded_whole(self):
+        # Fitbit split the night: 21:00-00:30, awake 2h, 02:30-06:00.
+        first = session(hours=3.5)
+        second = session(T + timedelta(hours=5.5), hours=3.5)
+        nap = session(T + timedelta(hours=16), hours=1)
+        merged = merge_split_nights([second, first, nap])
+        self.assertEqual(len(merged), 2)
+        night = merged[0]
+        self.assertEqual((night["start"], night["end"]), (first["start"], second["end"]))
+        self.assertEqual(stage_minutes(night)["AWAKE"], 10 + 120 + 10)
+        self.assertEqual(asleep_minutes(night), asleep_minutes(first) + asleep_minutes(second))
+        g = FakeGarmin()
+        now = second["end"] + timedelta(hours=4)
+        run_sleep_sync(CFG, FakeHealth([first, second, nap], hrv={wake_date(second): 30}), g, self.store, now=now)
+        self.assertEqual([start for start, _ in g.uploads], [first["start"]])
+
+    def test_naps_near_the_night_stay_separate(self):
+        night = session(hours=8)                                  # 21:00-05:00
+        nap = session(T + timedelta(hours=9), hours=0.75)         # 06:00-06:45, 1h later
+        self.assertEqual(len(merge_split_nights([night, nap])), 2)
+        # Two short naps 2h apart don't add up to a night either.
+        a, b = session(T, hours=0.75), session(T + timedelta(hours=2.75), hours=0.75)
+        self.assertEqual(len(merge_split_nights([a, b])), 2)
+
+    def test_overlapping_sessions_are_not_counted_twice(self):
+        whole = session(hours=8)
+        inner = session(T + timedelta(hours=2), hours=4)
+        merged = merge_split_nights([whole, inner])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(asleep_minutes(merged[0]), asleep_minutes(whole))
+        self.assertEqual(recorded_minutes(merged[0]), 480)
+
+    def test_heart_rate_and_length_leave_out_the_gap(self):
+        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)
+        night = merge_split_nights([first, second])[0]
+        self.assertEqual(recorded_minutes(night), 420)
+
+        class HR:
+            calls = []
+            def get_sleeping_heart_rate(self, a, b):
+                self.calls.append((a, b))
+                return 50.0 if a == first["start"] else 60.0
+        h = HR()
+        self.assertEqual(sleeping_heart_rate(h, night), 55.0)
+        self.assertEqual(h.calls, [(first["start"], first["end"]), (second["start"], second["end"])])
+
+    def test_short_fragment_between_halves_is_taken_in(self):
+        a = session(hours=3)                                      # 21:00-00:00
+        f0 = T + timedelta(hours=3.5)                             # 00:30-01:00
+        frag = {**session(f0, hours=1), "end": f0 + timedelta(minutes=30), "stages": [stage(0, 30, "LIGHT", f0)]}
+        c = session(T + timedelta(hours=4.5), hours=3)            # 01:30-04:30
+        merged = merge_split_nights([a, frag, c])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(recorded_minutes(merged[0]), 180 + 30 + 180)
+        stages = merged[0]["stages"]
+        self.assertTrue(all(x["end"] <= y["start"] for x, y in zip(stages, stages[1:])))
+
+    def test_main_session_is_chosen_by_recorded_time(self):
+        split = merge_split_nights([session(hours=2), session(T + timedelta(hours=4.4), hours=2)])[0]
+        whole = session(T + timedelta(hours=0.5), hours=6, offset=3600)
+        self.assertEqual(main_sessions([split, whole])[wake_date(whole)]["start"], whole["start"])
+
+    def test_night_waking_in_the_small_hours_waits_for_its_second_half(self):
+        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)  # wake 01:30 local
+        h, g = FakeHealth([first], hrv={wake_date(first): 30}), FakeGarmin()
+        run_sleep_sync(CFG, h, g, self.store, now=first["end"] + timedelta(hours=3, minutes=10))
+        self.assertEqual(g.uploads, [])
+        h.sessions = [first, second]
+        run_sleep_sync(CFG, h, g, self.store, now=second["end"] + timedelta(hours=3, minutes=10))
+        self.assertEqual([start for start, _ in g.uploads], [first["start"]])
+        # With no second part it still goes up once max_wait has passed.
+        other = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        g2 = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([first], hrv={wake_date(first): 30}), g2, other,
+                       now=first["end"] + timedelta(hours=12, minutes=10))
+        self.assertEqual(len(g2.uploads), 1)
+
+    def test_naps_of_an_hour_or_more_stay_off_the_night(self):
+        def nap(t, minutes):
+            return {**session(t, hours=1), "end": t + timedelta(minutes=minutes), "stages": [stage(0, minutes, "LIGHT", t)]}
+        # 17:00-18:30 local nap, bed 20:30-05:30 local (UTC+1): gap centred at 19:30 local.
+        evening = nap(T - timedelta(hours=4), 90)
+        night = session(T - timedelta(hours=0.5), hours=9)
+        morning = nap(night["end"] + timedelta(hours=1.5), 90)     # 07:00 local
+        self.assertEqual(len(merge_split_nights([evening, night, morning])), 3)
+
+    def test_fragments_are_not_matched_against_merged_nights(self):
+        # Two separate split nights a day apart, each with a fragment in its gap.
+        n1 = [session(hours=3), session(T + timedelta(hours=5), hours=3)]
+        t2 = T + timedelta(days=1)
+        n2 = [session(t2, hours=3), session(t2 + timedelta(hours=5), hours=3)]
+        frag = {**session(T + timedelta(hours=3.5), hours=1), "end": T + timedelta(hours=4),
+                "stages": [stage(0, 30, "LIGHT", T + timedelta(hours=3.5))]}
+        merged = merge_split_nights(n1 + n2 + [frag])
+        self.assertEqual(len(merged), 2)
+        self.assertEqual([len(m["parts"]) for m in merged], [3, 2])
+
+    def test_small_hours_wait_ends_at_ten(self):
+        first = session(hours=3.5)                                  # wakes 01:30 local
+        h = FakeHealth([first], hrv={wake_date(first): 30})
+        g = FakeGarmin()
+        nine = datetime(2026, 11, 22, 8, 0, tzinfo=timezone.utc)    # 09:00 local
+        run_sleep_sync(CFG, h, g, self.store, now=nine)
+        self.assertEqual(g.uploads, [])
+        run_sleep_sync(CFG, h, g, self.store, now=nine + timedelta(hours=1, minutes=5))
+        self.assertEqual(len(g.uploads), 1)
+
+    def test_night_overlapping_an_earlier_upload_is_not_uploaded_again(self):
+        first = session(T - timedelta(hours=3), hours=4)           # 19:00-23:00 local, wake date D-1
+        second = session(T + timedelta(hours=2.5), hours=7)        # 00:30-07:30 local, joins it
+        self.store.data["uploaded"][wake_date(first)] = first["start"].isoformat()
+        self.store.data["seen"][wake_date(first)] = "uploaded"
+        g = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([first, second], hrv={wake_date(second): 30}), g, self.store,
+                       now=second["end"] + timedelta(hours=4))
+        self.assertEqual(g.uploads, [])
+        self.assertEqual(self.store.data["seen"][wake_date(second)], "ours")
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])
