@@ -282,8 +282,24 @@ class TestRunSleepSync(unittest.TestCase):
         whole = session(T + timedelta(hours=0.5), hours=6, offset=3600)
         self.assertEqual(main_sessions([split, whole])[wake_date(whole)]["start"], whole["start"])
 
+    def test_night_waking_in_the_small_hours_waits_for_its_second_half(self):
+        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)  # wake 01:30 local
+        h, g = FakeHealth([first], hrv={wake_date(first): 30}), FakeGarmin()
+        run_sleep_sync(CFG, h, g, self.store, now=first["end"] + timedelta(hours=3, minutes=10))
+        self.assertEqual(g.uploads, [])
+        h.sessions = [first, second]
+        run_sleep_sync(CFG, h, g, self.store, now=second["end"] + timedelta(hours=3, minutes=10))
+        self.assertEqual([start for start, _ in g.uploads], [first["start"]])
+        # With no second part it still goes up once max_wait has passed.
+        other = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        g2 = FakeGarmin()
+        run_sleep_sync(CFG, FakeHealth([first], hrv={wake_date(first): 30}), g2, other,
+                       now=first["end"] + timedelta(hours=12, minutes=10))
+        self.assertEqual(len(g2.uploads), 1)
+
     def test_night_uploaded_before_its_second_half_is_uploaded_again(self):
-        first, second = session(hours=3.5), session(T + timedelta(hours=5.5), hours=3.5)
+        t0 = T + timedelta(hours=6)                               # 03:00-06:30 UTC, wake 07:30 local
+        first, second = session(t0, hours=3.5), session(t0 + timedelta(hours=5.5), hours=3.5)
         d = wake_date(second)
         h, g = FakeHealth([first], hrv={wake_date(first): 30, d: 30}), FakeGarmin()
         cfg = {**CFG, "sleep": {**CFG["sleep"], "holdback_hours": 3}}
@@ -298,6 +314,15 @@ class TestRunSleepSync(unittest.TestCase):
         self.assertEqual(self.store.data["uploaded_end"][d], second["end"].isoformat())
         run_sleep_sync(cfg, h, g, self.store, now=later + timedelta(hours=1))
         self.assertEqual(len(g.uploads), 2)
+        # A watch night Garmin holds for the date is never replaced by a grown night.
+        other = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        g3, h3 = FakeGarmin(), FakeHealth([first], hrv={d: 30})
+        run_sleep_sync(cfg, h3, g3, other, now=first["end"] + timedelta(hours=3, minutes=10))
+        g3.nights[d] = {"start": first["start"] - timedelta(hours=1), "end": second["end"], "score": 80,
+                        "need": 470, "asleep": 420.0, "hr": 55}
+        h3.sessions = [first, second]
+        run_sleep_sync(cfg, h3, g3, other, now=later)
+        self.assertEqual(len(g3.uploads), 1)
 
     def test_refreshes_google_token(self):
         h = FakeHealth([])
