@@ -83,6 +83,12 @@ class StateStore:
 
 
 
+# Backfill shifts time_created 1–15 s earlier per attempt; other files use other seconds
+# (see fit_engine.SLEEP_CREATED_DELAY). Past 15 attempts a shift repeats and Garmin
+# answers "duplicate", which counts as uploaded.
+BACKFILL_MAX_SHIFT = 15
+
+
 def load_config(path: str) -> dict:
     if not os.path.exists(path):
         log.error("Config file not found: %s", path)
@@ -286,9 +292,10 @@ def run_sync(cfg: dict, health: GoogleHealthClient, garmin: GarminClient, state:
             state.save_backfill_attempts(attempts)
             # Shift time_created a few seconds earlier per attempt so Garmin doesn't
             # reject it as a duplicate of an earlier upload starting at the same minute
-            # (kept under a minute so it can't collide with the minute before).
+            # (1–BACKFILL_MAX_SHIFT s, so it can't collide with the minute before or the sleep files).
             try:
-                result = _upload_segment(cfg, garmin, seg, utc_offset_seconds, time_created_offset=tries % 59 + 1)
+                result = _upload_segment(cfg, garmin, seg, utc_offset_seconds,
+                                         time_created_offset=tries % BACKFILL_MAX_SHIFT + 1)
                 log.info("Backfill upload complete: %s", result)
             except Exception as e:
                 # Backfill is best effort: new data is already uploaded; try the rest.

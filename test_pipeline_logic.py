@@ -528,15 +528,15 @@ class TestRunSyncBackfill(unittest.TestCase):
         self._run()  # must not raise
         self.assertEqual(calls, [second[0]["datetime"], self.old_start])
 
-    def test_time_created_shift_stays_under_a_minute(self):
+    def test_time_created_shift_stays_within_its_seconds(self):
         self.cfg["sync"]["backfill_max_attempts"] = 200
         self.health.get_combined_intraday.return_value = (self.points[:30], 3600)
-        attempts = {p["datetime"]: 58 for p in self.points[:30]}
+        attempts = {p["datetime"]: 14 for p in self.points[:30]}
         self.state.save_backfill_attempts(attempts)
         self._run()
-        self.state.save_backfill_attempts({p["datetime"]: 59 for p in self.points[:30]})
+        self.state.save_backfill_attempts({p["datetime"]: 15 for p in self.points[:30]})
         self._run()
-        self.assertEqual([off for _, off in self.uploaded], [59, 1])
+        self.assertEqual([off for _, off in self.uploaded], [15, 1])
 
     def test_short_holes_are_not_backfilled(self):
         self.health.get_combined_intraday.return_value = (self.points[:5] + self.points[30:], 3600)

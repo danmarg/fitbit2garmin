@@ -200,11 +200,14 @@ class GarminClient:
         self,
         fit_bytes: bytes,
         window_start: datetime,
+        kind: str = "",
     ) -> dict:
         # Include upload-time seconds in the filename so retries never collide with
         # a previously uploaded file for the same window (Garmin returns 409 on
         # filename re-use even when the content has changed).
         date_str = window_start.strftime("%Y-%m-%d")
         upload_ts = datetime.now(timezone.utc).strftime("%H%M%S")
-        filename = f"fitbit2garmin_{date_str}_{window_start.strftime('%H%M')}_{upload_ts}.fit"
+        # `kind` keeps files of a night uploaded in the same second apart (vitals, HRV, sleep).
+        kind = f"{kind}_" if kind else ""
+        filename = f"fitbit2garmin_{kind}{date_str}_{window_start.strftime('%H%M')}_{upload_ts}.fit"
         return self.upload_fit(fit_bytes, filename=filename)
