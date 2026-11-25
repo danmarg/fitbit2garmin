@@ -391,7 +391,8 @@ def build_sleep_fit(
     file_id, file_creator, device_info, sleep_data_info (273), sleep start/stop events
     (74), sleep_assessment (346), then sleep_level (275) records stamped at each
     stage's END. `assessment` maps SLEEP_ASSESSMENT_FIELDS names to values; Garmin
-    ignores the night without it. time_created is created_delay seconds after waking.
+    ignores the night without it. time_created is created_delay seconds after waking,
+    floored to the whole minute (see SLEEP_CREATED_DELAY).
     """
     start_ts, end_ts, levels = _sleep_level_records(stages)
     created = end_ts // 60 * 60 + created_delay  # whole minute first: see SLEEP_CREATED_DELAY

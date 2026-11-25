@@ -381,8 +381,9 @@ class GoogleHealthClient:
         out = []
         for p in points:
             v = p.get(field) or {}
-            if (p.get("dataSource") or {}).get("platform") == platform and v.get(value):
-                out.append((_parse_time(v["sampleTime"]["physicalTime"]), float(v[value])))
+            when = (v.get("sampleTime") or {}).get("physicalTime")
+            if (p.get("dataSource") or {}).get("platform") == platform and v.get(value) and when:
+                out.append((_parse_time(when), float(v[value])))
         return sorted(out)
 
     def get_spo2(self, start: datetime, end: datetime, platform: str = "FITBIT") -> list[tuple[datetime, float]]:

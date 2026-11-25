@@ -321,7 +321,10 @@ def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: in
             log.info("No SpO2 or breathing rate to send for %s (%s).", day, e)
             continue
         log.info("Uploading SpO2 and breathing rate for %s.", day)
-        garmin.upload_fit_for_window(fit, min(t for t, _ in sp + rs), kind="vitals")
+        try:
+            garmin.upload_fit_for_window(fit, min(t for t, _ in sp + rs), kind="vitals")
+        except Exception as e:  # one day failing must not cost the other its upload
+            log.warning("SpO2/breathing-rate upload for %s failed (%s) — continuing without it.", day, e)
 
 
 def _upload_hrv(health, garmin, session: dict, ident: tuple, sw: int):

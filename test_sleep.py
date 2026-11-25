@@ -627,6 +627,20 @@ class TestRunSleepSyncVitals(unittest.TestCase):
         run_sleep_sync(VCFG, h, g, store, now=self.now)
         self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [68, 49])
 
+    def test_one_day_failing_does_not_block_the_next(self):
+        s, h = self.health()
+        g = FakeGarmin()
+        real, calls = g.upload_fit_for_window, []
+        def flaky(fit_bytes, start, kind=""):
+            calls.append(kind)
+            if len(calls) == 1:
+                raise RuntimeError("502")
+            return real(fit_bytes, start, kind)
+        g.upload_fit_for_window = flaky
+        run_sleep_sync(VCFG, h, g, self.store, now=self.now)
+        self.assertEqual(calls, ["vitals", "vitals", "hrv", "sleep"])
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [32, 68, 49])
+
     def test_vitals_day_with_nothing_after_midnight_is_skipped(self):
         # the only reading on the second local date is at 00:00:00, before time_created
         with self.assertRaises(ValueError):
