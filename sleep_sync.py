@@ -43,7 +43,8 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import sleep_score
-from fit_engine import SLEEP_LEVELS, build_hrv_fit, build_sleep_fit, build_vitals_fit
+from fit_engine import (GARMIN_EPOCH, SLEEP_CREATED_DELAY, SLEEP_LEVELS, _sleep_level_records, build_hrv_fit,
+                        build_sleep_fit, build_vitals_fit)
 
 log = logging.getLogger("fitbit2garmin.sleep")
 
@@ -279,17 +280,29 @@ def by_local_date(samples: list[tuple[datetime, float]], offset: int) -> dict:
 def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: int):
     offset, end = session["utc_offset_seconds"], session["end"]
     in_parts = lambda t: any(a <= t <= b for a, b in parts(session))
-    spo2 = [x for x in health.get_spo2(session["start"], end) if in_parts(x[0])]
-    rates = health.get_sleep_respiration(end)
-    if not rates:
-        log.info("No Fitbit breathing rate for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
-    resp = minute_respiration(session, rates) if rates else []
+    spo2, resp = [], []
+    try:
+        spo2 = [x for x in health.get_spo2(session["start"], end) if in_parts(x[0])]
+    except Exception as e:
+        log.warning("Fitbit SpO2 unavailable (%s) — sending breathing rate only.", e)
+    try:
+        rates = health.get_sleep_respiration(end)
+        if rates:
+            resp = minute_respiration(session, rates)
+        else:
+            log.info("No Fitbit breathing rate for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
+    except Exception as e:
+        log.warning("Fitbit breathing rate unavailable (%s) — sending SpO2 only.", e)
     spo2_by_day, resp_by_day = by_local_date(spo2, offset), by_local_date(resp, offset)
     for day in sorted(set(spo2_by_day) | set(resp_by_day)):
         sp, rs = spo2_by_day.get(day, []), resp_by_day.get(day, [])
-        fit = build_vitals_fit(sp, rs, *ident, software_version=sw, utc_offset_seconds=offset)
-        log.info("Uploading %d SpO2 and %d breathing-rate reading(s) for %s.", len(sp), len(rs), day)
-        garmin.upload_fit_for_window(fit, min(t for t, _ in sp + rs))
+        try:
+            fit = build_vitals_fit(sp, rs, *ident, software_version=sw, utc_offset_seconds=offset)
+        except ValueError as e:  # nothing left for that day (readings before time_created)
+            log.info("No SpO2 or breathing rate to send for %s (%s).", day, e)
+            continue
+        log.info("Uploading SpO2 and breathing rate for %s.", day)
+        garmin.upload_fit_for_window(fit, min(t for t, _ in sp + rs), kind="vitals")
 
 
 def _upload_hrv(health, garmin, session: dict, ident: tuple, sw: int):
@@ -299,10 +312,17 @@ def _upload_hrv(health, garmin, session: dict, ident: tuple, sw: int):
     if not values:
         log.info("No Fitbit HRV readings for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
         return
-    # One second before the sleep file's time_created (build_sleep_fit: last stage end + 60 s).
-    created = max(x["end"] for x in session["stages"]) + timedelta(seconds=59)
+    # One second before the sleep file's time_created, as on the watch.
+    created = sleep_created(session) - timedelta(seconds=1)
     log.info("Uploading %d HRV reading(s) for the night ending %s.", len(values), f"{end:%Y-%m-%d %H:%M}")
-    garmin.upload_fit_for_window(build_hrv_fit(values, created, *ident, software_version=sw), values[0][0])
+    garmin.upload_fit_for_window(build_hrv_fit(values, created, *ident, software_version=sw), values[0][0],
+                                 kind="hrv")
+
+
+def sleep_created(session: dict) -> datetime:
+    """The sleep file's time_created, as build_sleep_fit sets it."""
+    _, end_ts, _ = _sleep_level_records(session["stages"])
+    return datetime.fromtimestamp(end_ts + GARMIN_EPOCH + SLEEP_CREATED_DELAY, tz=timezone.utc)
 
 
 def upload_vitals(health, garmin, session: dict, device: dict, spo2_resp: bool = True, hrv: bool = True):
@@ -311,7 +331,9 @@ def upload_vitals(health, garmin, session: dict, device: dict, spo2_resp: bool =
     before its sleep file (the watch's order: monitoring, HRV, sleep). Each part is
     independent; one that fails is logged and skipped, and never holds up the sleep
     upload. Vitals are sent once, with the sleep file: a retry after a failed sleep upload
-    sends the same files again, which Garmin answers as duplicates.
+    sends the same files again, which Garmin answers as duplicates. A night uploaded
+    before Fitbit has published its HRV or breathing rate goes without them.
+    Uploading these did not disturb the night's heart rate on Garmin (Nov 24 test).
     """
     ident = (device["manufacturer"], device["product_id"], device["serial_number"])
     sw = device.get("software_version", 331)
@@ -531,7 +553,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                  "n/a" if stress is None else f"{stress:.0f}")
         upload_vitals(health, garmin, s, device, spo2_resp=scfg.get("vitals", True), hrv=scfg.get("hrv", True))
         try:
-            result = garmin.upload_fit_for_window(fit_bytes, s["start"])
+            result = garmin.upload_fit_for_window(fit_bytes, s["start"], kind="sleep")
         except Exception as e:
             store.fail(d, f"upload failed ({e})")
             store.save()

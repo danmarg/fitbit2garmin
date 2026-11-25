@@ -279,6 +279,13 @@ def build_monitoring_fit(
 # Sleep
 # ---------------------------------------------------------------------------
 
+# time_created must differ between files with the same serial, or Garmin rejects the
+# later one as a duplicate. Every file starts its time_created at a fixed second of the
+# minute so the kinds can never meet:
+#   heart rate :00 (first point)        backfill :45–:59 (main.BACKFILL_MAX_SHIFT)
+#   SpO2/breathing :19 (build_vitals_fit) HRV :29, sleep :30 (stage ends are whole minutes)
+SLEEP_CREATED_DELAY = 90
+
 MESG_NUM_FILE_CREATOR = 49
 MESG_NUM_SLEEP_LEVEL = 275
 MESG_NUM_SLEEP_ASSESSMENT = 346
@@ -375,7 +382,7 @@ def build_sleep_fit(
     assessment: dict,
     software_version: int = 331,
     utc_offset_seconds: int = 0,
-    created_delay: int = 60,
+    created_delay: int = SLEEP_CREATED_DELAY,
 ) -> bytes:
     """
     Build a sleep FIT file (file_id.type 49) for one night, laid out like the file a
@@ -463,9 +470,9 @@ def build_vitals_fit(
     The one walking cycle keeps Garmin from discarding the file as empty (see
     _monitoring_messages). time_created is 41 s before the first whole minute: records
     before time_created are dropped, and Garmin treats a second file with the same
-    serial and time_created as a duplicate, so it must miss the heart-rate files'
-    (whole minutes, less 0–21 s on backfill). If that would fall before local midnight,
-    it is 19 s after midnight instead.
+    serial and time_created as a duplicate, so it must miss the other files' seconds
+    (see TIME_CREATED_SECONDS). If that would fall before local midnight, it is 19 s
+    after midnight instead. Raises ValueError if no reading is left after that.
     """
     times = [t for t, _ in spo2] + [t for t, _ in respiration]
     if not times:
@@ -478,6 +485,8 @@ def build_vitals_fit(
         created = local_midnight + 86400 + 19
     spo2 = [(t, v) for t, v in spo2 if to_garmin_ts(t) >= created]
     respiration = [(t, v) for t, v in respiration if to_garmin_ts(t) >= created]
+    if not spo2 and not respiration:
+        raise ValueError("No SpO2 or respiration readings after local midnight")
 
     m = b""
     m += _file_id_messages(manufacturer, product_id, serial_number, created, file_number=0xFFFF)  # type 32

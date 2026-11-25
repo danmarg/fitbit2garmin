@@ -38,7 +38,7 @@ class TestSleepFit(unittest.TestCase):
         fields = lambda m: {d.def_num: d.raw_value for d in m}
         file_id = fields(msgs[0])
         end = to_garmin_ts(T + timedelta(minutes=100))
-        self.assertEqual((file_id[0], file_id[4]), (49, end + 60))
+        self.assertEqual((file_id[0], file_id[4]), (49, end + 90))
         events = [fields(m) for m in msgs if m.mesg_num == 21]
         self.assertEqual([(e[253], e[3], e[0], e[1]) for e in events],
                          [(to_garmin_ts(T), to_garmin_ts(T) + 3600, 74, 0), (end, end + 3600, 74, 1)])
@@ -174,10 +174,11 @@ class FakeGarmin:
             raise RuntimeError("boom")
         return self.nights.get(d)
 
-    def upload_fit_for_window(self, fit_bytes, start):
+    def upload_fit_for_window(self, fit_bytes, start, kind=""):
         if self.upload_fails:
             raise RuntimeError("502")
         self.uploads.append((start, fit_bytes))
+        self.kinds = getattr(self, "kinds", []) + [kind]
         return {"ok": True}
 
 
@@ -594,14 +595,28 @@ class TestRunSleepSyncVitals(unittest.TestCase):
         self.assertEqual(fit_fields(g.uploads[1][1])[0][1][4], midnight + 19)
         hrv_created, sleep_created = fit_fields(g.uploads[2][1])[0][1][4], fit_fields(g.uploads[3][1])[0][1][4]
         self.assertEqual(hrv_created, sleep_created - 1)
+        # each kind of file has its own time_created second, and its own filename
+        self.assertEqual([fit_fields(raw)[0][1][4] % 60 for _, raw in g.uploads],
+                         [19, 19, 29, 30])
+        self.assertEqual(g.kinds, ["vitals", "vitals", "hrv", "sleep"])
         self.assertEqual(self.store.data["seen"][wake_date(s)], "uploaded")
 
     def test_vitals_failure_does_not_block_sleep(self):
         s, h = self.health()
-        h.vitals_fail = True
+        h.vitals_fail = True  # SpO2 fails: breathing rate, HRV and sleep still go up
         g = FakeGarmin()
         run_sleep_sync(CFG, h, g, self.store, now=self.now)
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [32, 32, 68, 49])
+        self.assertTrue(all(m != 269 for raw in (g.uploads[0][1], g.uploads[1][1]) for m, _ in fit_fields(raw)))
+        h.respiration = None
+        g, store = FakeGarmin(), SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        run_sleep_sync(CFG, h, g, store, now=self.now)
         self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [68, 49])
+
+    def test_vitals_day_with_nothing_after_midnight_is_skipped(self):
+        # the only reading on the second local date is at 00:00:00, before time_created
+        with self.assertRaises(ValueError):
+            build_vitals_fit([], [(T + timedelta(hours=2), 16.0)], 1, 3993, 7, utc_offset_seconds=3600)
 
     def test_vitals_can_be_turned_off(self):
         s, h = self.health()
