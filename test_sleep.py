@@ -11,7 +11,8 @@ import fitparse
 import sleep_score
 from fit_engine import build_sleep_fit, to_garmin_ts, _sleep_level_records
 from google_health_client import GoogleHealthClient
-from sleep_sync import SleepStore, asleep_minutes, main_sessions, merge_split_nights, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
+from fit_engine import build_hrv_fit, build_vitals_fit
+from sleep_sync import SleepStore, asleep_minutes, main_sessions, merge_split_nights, minute_respiration, recorded_minutes, sleeping_heart_rate, run_sleep_sync, stage_minutes, wake_date
 
 T = datetime(2026, 11, 21, 21, 0, tzinfo=timezone.utc)
 
@@ -147,6 +148,19 @@ class FakeHealth:
         if self.hr_fails:
             raise RuntimeError("rollup 500")
         return self.hr
+
+    spo2, hrv_samples, respiration, vitals_fail = [], [], None, False
+
+    def get_spo2(self, start, end):
+        if self.vitals_fail:
+            raise RuntimeError("spo2 500")
+        return [x for x in self.spo2 if start <= x[0] < end]
+
+    def get_hrv(self, start, end):
+        return [x for x in self.hrv_samples if start <= x[0] < end]
+
+    def get_sleep_respiration(self, near):
+        return self.respiration
 
 
 class FakeGarmin:
@@ -514,6 +528,95 @@ class TestRunSleepSync(unittest.TestCase):
         self.assertLessEqual({wake_date(x) for x in sessions}, set(self.store.data["seen"]))
         run_sleep_sync(cfg, h, g, self.store, now=self.now)
         self.assertGreater(h.since[-1], self.now - timedelta(days=4))
+
+
+def fit_fields(raw):
+    return [(m.mesg_num, {d.def_num: d.raw_value for d in m}) for m in fitparse.FitFile(io.BytesIO(raw)).get_messages()]
+
+
+class TestVitals(unittest.TestCase):
+    def test_vitals_file_layout(self):
+        t = T + timedelta(minutes=5, seconds=30)
+        raw = build_vitals_fit([(t, 95.6)], [(T + timedelta(minutes=6), 16.84)], 1, 3993, 7, utc_offset_seconds=3600)
+        msgs = fit_fields(raw)
+        file_id = msgs[0][1]
+        self.assertEqual((file_id[0], file_id[4]), (32, to_garmin_ts(T + timedelta(minutes=5)) - 41))
+        self.assertEqual([m for m, _ in msgs], [0, 23, 103, 55, 269, 297])
+        self.assertEqual(msgs[3][1][3], 1)  # the one walking cycle
+        self.assertEqual((msgs[4][1][0], msgs[4][1][2]), (96, 3))
+        self.assertEqual(msgs[5][1][0], 1684)
+
+    def test_hrv_file_layout(self):
+        vals = [(T + timedelta(minutes=5 * i), v) for i, v in enumerate([20.0, 30.0, 25.5])]
+        raw = build_hrv_fit(vals, T + timedelta(hours=8), 1, 3993, 7)
+        msgs = fit_fields(raw)
+        self.assertEqual((msgs[0][1][0], msgs[0][1][4]), (68, to_garmin_ts(T + timedelta(hours=8))))
+        self.assertEqual([v[0] for m, v in msgs if m == 371], [2560, 3840, 3264])
+        summary = next(v for m, v in msgs if m == 370)
+        self.assertEqual((summary[1], summary[2], summary[3], summary[6]), (round(25.1667 * 128), 3840, None, 0))
+
+    def test_minute_respiration_by_stage_and_parts_only(self):
+        s = {"start": T, "end": T + timedelta(minutes=50), "utc_offset_seconds": 3600,
+             "stages": [stage(0, 10, "DEEP"), stage(10, 40, "AWAKE"), stage(40, 50, "REM")],
+             "parts": [(T, T + timedelta(minutes=10)), (T + timedelta(minutes=40), T + timedelta(minutes=50))]}
+        out = minute_respiration(s, {"DEEP": 15.0, "REM": 17.0, "FULL": 16.0})
+        self.assertEqual(len(out), 20)
+        self.assertEqual({v for t, v in out if t <= T + timedelta(minutes=10)}, {15.0})
+        self.assertEqual({v for t, v in out if t > T + timedelta(minutes=40)}, {17.0})
+        out = minute_respiration(s, {"FULL": 16.0})
+        self.assertEqual({v for _, v in out}, {16.0})
+
+
+class TestRunSleepSyncVitals(unittest.TestCase):
+    def setUp(self):
+        self.store = SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        self.now = T + timedelta(hours=14)
+
+    def health(self):
+        s = session()
+        h = FakeHealth([s], hrv={wake_date(s): 30})
+        h.spo2 = [(T + timedelta(minutes=m, seconds=30), 96.0) for m in range(0, 480, 2)]
+        h.hrv_samples = [(T + timedelta(minutes=m), 25.0) for m in range(5, 480, 5)]
+        h.respiration = {"DEEP": 15.0, "LIGHT": 16.0, "REM": 17.0, "FULL": 16.2}
+        return s, h
+
+    def test_vitals_split_at_local_midnight_then_hrv_then_sleep(self):
+        s, h = self.health()
+        g = FakeGarmin()
+        run_sleep_sync(CFG, h, g, self.store, now=self.now)
+        types = [fit_fields(raw)[0][1][0] for _, raw in g.uploads]
+        self.assertEqual(types, [32, 32, 68, 49])
+        midnight = to_garmin_ts(T + timedelta(hours=2))  # 23:00 UTC = 00:00 local
+        before = [v[253] for m, v in fit_fields(g.uploads[0][1]) if m in (269, 297)]
+        after = [v[253] for m, v in fit_fields(g.uploads[1][1]) if m in (269, 297)]
+        self.assertTrue(before and after and max(before) < midnight <= min(after))
+        self.assertEqual(len(before) + len(after), 240 + 480 - 1)  # the 00:00 reading precedes time_created
+        self.assertEqual(fit_fields(g.uploads[1][1])[0][1][4], midnight + 19)
+        hrv_created, sleep_created = fit_fields(g.uploads[2][1])[0][1][4], fit_fields(g.uploads[3][1])[0][1][4]
+        self.assertEqual(hrv_created, sleep_created - 1)
+        self.assertEqual(self.store.data["seen"][wake_date(s)], "uploaded")
+
+    def test_vitals_failure_does_not_block_sleep(self):
+        s, h = self.health()
+        h.vitals_fail = True
+        g = FakeGarmin()
+        run_sleep_sync(CFG, h, g, self.store, now=self.now)
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [68, 49])
+
+    def test_vitals_can_be_turned_off(self):
+        s, h = self.health()
+        g = FakeGarmin()
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "vitals": False}}
+        run_sleep_sync(cfg, h, g, self.store, now=self.now)
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [68, 49])
+        g, store = FakeGarmin(), SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "vitals": False, "hrv": False}}
+        run_sleep_sync(cfg, h, g, store, now=self.now)
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [49])
+        g, store = FakeGarmin(), SleepStore(os.path.join(tempfile.mkdtemp(), "sleep.json"))
+        cfg = {**CFG, "sleep": {**CFG["sleep"], "hrv": False}}
+        run_sleep_sync(cfg, h, g, store, now=self.now)
+        self.assertEqual([fit_fields(raw)[0][1][0] for _, raw in g.uploads], [32, 32, 49])
 
 
 if __name__ == "__main__":

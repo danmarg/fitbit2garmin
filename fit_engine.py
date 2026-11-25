@@ -32,6 +32,7 @@ UINT8  = 0x02
 UINT16 = 0x84
 UINT32 = 0x86
 UINT32Z = 0x8C
+SINT16 = 0x83
 
 
 def to_garmin_ts(dt: datetime) -> int:
@@ -428,4 +429,114 @@ def build_sleep_fit(
 
     raw = _wrap_fit(m)
     log.info("Built sleep FIT file: %d level record(s), %d bytes", len(levels), len(raw))
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Overnight vitals: SpO2 and respiration (monitoring_b), HRV (hrv status)
+# ---------------------------------------------------------------------------
+
+FILE_TYPE_HRV_STATUS = 68
+MESG_NUM_SPO2_DATA = 269
+MESG_NUM_RESPIRATION_RATE = 297
+MESG_NUM_HRV_STATUS_SUMMARY = 370
+MESG_NUM_HRV_VALUE = 371
+SPO2_MODE_PERIODIC = 3
+
+
+def build_vitals_fit(
+    spo2: list[tuple[datetime, float]],
+    respiration: list[tuple[datetime, float]],
+    manufacturer: int,
+    product_id: int,
+    serial_number: int,
+    software_version: int = 331,
+    utc_offset_seconds: int = 0,
+) -> bytes:
+    """
+    Build a monitoring_b file (type 32) with SpO2 (269, %) and respiration (297,
+    breaths/min) readings, as the FR255S writes them overnight (MBP75600.FIT). Garmin
+    accepted this layout on 2026-11-25 and showed both on the night's sleep page, even
+    though the sleep file had gone up earlier. The readings must lie within one local
+    date (Garmin discards monitoring files that span local midnight).
+
+    The one walking cycle keeps Garmin from discarding the file as empty (see
+    _monitoring_messages). time_created is 41 s before the first whole minute: records
+    before time_created are dropped, and Garmin treats a second file with the same
+    serial and time_created as a duplicate, so it must miss the heart-rate files'
+    (whole minutes, less 0–21 s on backfill). If that would fall before local midnight,
+    it is 19 s after midnight instead.
+    """
+    times = [t for t, _ in spo2] + [t for t, _ in respiration]
+    if not times:
+        raise ValueError("No SpO2 or respiration readings provided")
+    created = to_garmin_ts(min(times).replace(second=0, microsecond=0)) - 41
+    # ...but never before local midnight: a time_created on the previous local date would
+    # make the file span midnight. Readings before it (at most the first minute) are dropped.
+    local_midnight = (created + utc_offset_seconds) // 86400 * 86400 - utc_offset_seconds
+    if local_midnight != (to_garmin_ts(max(times)) + utc_offset_seconds) // 86400 * 86400 - utc_offset_seconds:
+        created = local_midnight + 86400 + 19
+    spo2 = [(t, v) for t, v in spo2 if to_garmin_ts(t) >= created]
+    respiration = [(t, v) for t, v in respiration if to_garmin_ts(t) >= created]
+
+    m = b""
+    m += _file_id_messages(manufacturer, product_id, serial_number, created, file_number=0xFFFF)  # type 32
+    m += _device_info_messages(manufacturer, product_id, serial_number, created, software_version)
+    m += _definition_record(2, MESG_NUM_MONITORING_INFO, [(253, 4, UINT32), (0, 4, UINT32), (1, 1, ENUM)])
+    m += _data_record(2, [created, created + utc_offset_seconds, 6], "IIB")
+    m += _definition_record(3, MESG_NUM_MONITORING, [(253, 4, UINT32), (3, 4, UINT32), (5, 1, ENUM)])
+    m += _data_record(3, [created, 1, 6], "IIB")
+    m += _definition_record(4, MESG_NUM_RESPIRATION_RATE, [(253, 4, UINT32), (0, 2, SINT16)])
+    m += _definition_record(5, MESG_NUM_SPO2_DATA, [(253, 4, UINT32), (0, 1, UINT8), (1, 1, UINT8), (2, 1, ENUM)])
+    records = sorted([(to_garmin_ts(t), 4, v) for t, v in respiration] + [(to_garmin_ts(t), 5, v) for t, v in spo2])
+    for ts, local, v in records:
+        if local == 4:
+            m += _data_record(4, [ts, round(v * 100)], "Ih")
+        else:  # confidence unknown: invalid
+            m += _data_record(5, [ts, max(0, min(100, round(v))), 0xFF, SPO2_MODE_PERIODIC], "IBBB")
+    raw = _wrap_fit(m)
+    log.info("Built vitals FIT file: %d SpO2, %d respiration reading(s), %d bytes",
+             len(spo2), len(respiration), len(raw))
+    return raw
+
+
+def build_hrv_fit(
+    values: list[tuple[datetime, float]],
+    created: datetime,
+    manufacturer: int,
+    product_id: int,
+    serial_number: int,
+    software_version: int = 331,
+) -> bytes:
+    """
+    Build an HRV status file (type 68) like the FR255S's HRVStatus/GBP74437.fit: 5-minute
+    RMSSD values (371, ms) and a summary (370) with the night's average and 5-minute high.
+    The baseline and weekly average are left invalid and the status "none": they come
+    from the user's history, which only Garmin has. The watch stamps this file 1 s before
+    the sleep file.
+    """
+    if not values:
+        raise ValueError("No HRV values provided")
+    ts = to_garmin_ts(created)
+    ms = [v for _, v in values]
+    m = b""
+    m += _definition_record(0, MESG_NUM_FILE_ID, [
+        (3, 4, UINT32Z), (4, 4, UINT32), (7, 4, UINT32), (1, 2, UINT16), (2, 2, UINT16), (5, 2, UINT16), (0, 1, ENUM),
+    ])
+    m += _data_record(0, [serial_number, ts, 0xFFFFFFFF, manufacturer, product_id, 0xFFFF, FILE_TYPE_HRV_STATUS],
+                      "IIIHHHB")
+    m += _definition_record(1, MESG_NUM_FILE_CREATOR, [(0, 2, UINT16)])
+    m += _data_record(1, [software_version], "H")
+    m += _device_info_messages(manufacturer, product_id, serial_number, to_garmin_ts(values[0][0]), software_version)
+    m += _definition_record(3, MESG_NUM_HRV_VALUE, [(253, 4, UINT32), (0, 2, UINT16)])
+    for t, v in values:
+        m += _data_record(3, [to_garmin_ts(t), round(v * 128)], "IH")
+    m += _definition_record(4, MESG_NUM_HRV_STATUS_SUMMARY, [
+        (253, 4, UINT32), (0, 2, UINT16), (1, 2, UINT16), (2, 2, UINT16), (3, 2, UINT16), (4, 2, UINT16),
+        (5, 2, UINT16), (6, 1, ENUM),
+    ])
+    m += _data_record(4, [ts, 0xFFFF, round(sum(ms) / len(ms) * 128), round(max(ms) * 128),
+                          0xFFFF, 0xFFFF, 0xFFFF, 0], "IHHHHHHB")
+    raw = _wrap_fit(m)
+    log.info("Built HRV FIT file: %d value(s), %d bytes", len(values), len(raw))
     return raw

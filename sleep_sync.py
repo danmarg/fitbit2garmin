@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 import sleep_score
-from fit_engine import SLEEP_LEVELS, build_sleep_fit
+from fit_engine import SLEEP_LEVELS, build_hrv_fit, build_sleep_fit, build_vitals_fit
 
 log = logging.getLogger("fitbit2garmin.sleep")
 
@@ -252,6 +252,79 @@ def sleeping_heart_rate(health, session: dict) -> float | None:
     return total / weight if weight else None
 
 
+def minute_respiration(session: dict, rates: dict[str, float]) -> list[tuple[datetime, float]]:
+    """
+    A breathing rate for each recorded minute of the night, from Fitbit's per-stage
+    averages (it gives no per-minute rate): each minute gets its stage's rate, and
+    awake minutes or stages without one get the whole-night rate.
+    """
+    out = []
+    for a, b in parts(session):
+        t = a.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        while t <= b:
+            stage = next((x["type"] for x in session["stages"] if x["start"] < t <= x["end"]), None)
+            out.append((t, rates.get(stage, rates["FULL"])))
+            t += timedelta(minutes=1)
+    return out
+
+
+def by_local_date(samples: list[tuple[datetime, float]], offset: int) -> dict:
+    """Samples grouped by local date: Garmin discards a monitoring file spanning local midnight."""
+    out: dict = {}
+    for t, v in samples:
+        out.setdefault((t + timedelta(seconds=offset)).date(), []).append((t, v))
+    return out
+
+
+def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: int):
+    offset, end = session["utc_offset_seconds"], session["end"]
+    in_parts = lambda t: any(a <= t <= b for a, b in parts(session))
+    spo2 = [x for x in health.get_spo2(session["start"], end) if in_parts(x[0])]
+    rates = health.get_sleep_respiration(end)
+    if not rates:
+        log.info("No Fitbit breathing rate for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
+    resp = minute_respiration(session, rates) if rates else []
+    spo2_by_day, resp_by_day = by_local_date(spo2, offset), by_local_date(resp, offset)
+    for day in sorted(set(spo2_by_day) | set(resp_by_day)):
+        sp, rs = spo2_by_day.get(day, []), resp_by_day.get(day, [])
+        fit = build_vitals_fit(sp, rs, *ident, software_version=sw, utc_offset_seconds=offset)
+        log.info("Uploading %d SpO2 and %d breathing-rate reading(s) for %s.", len(sp), len(rs), day)
+        garmin.upload_fit_for_window(fit, min(t for t, _ in sp + rs))
+
+
+def _upload_hrv(health, garmin, session: dict, ident: tuple, sw: int):
+    end = session["end"]
+    values = [x for x in health.get_hrv(session["start"], end + timedelta(minutes=1))
+              if any(a <= x[0] <= b for a, b in parts(session))]
+    if not values:
+        log.info("No Fitbit HRV readings for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
+        return
+    # One second before the sleep file's time_created (build_sleep_fit: last stage end + 60 s).
+    created = max(x["end"] for x in session["stages"]) + timedelta(seconds=59)
+    log.info("Uploading %d HRV reading(s) for the night ending %s.", len(values), f"{end:%Y-%m-%d %H:%M}")
+    garmin.upload_fit_for_window(build_hrv_fit(values, created, *ident, software_version=sw), values[0][0])
+
+
+def upload_vitals(health, garmin, session: dict, device: dict, spo2_resp: bool = True, hrv: bool = True):
+    """
+    Upload Fitbit's SpO2 and breathing rate (`spo2_resp`) and HRV (`hrv`) for a night,
+    before its sleep file (the watch's order: monitoring, HRV, sleep). Each part is
+    independent; one that fails is logged and skipped, and never holds up the sleep
+    upload. Vitals are sent once, with the sleep file: a retry after a failed sleep upload
+    sends the same files again, which Garmin answers as duplicates.
+    """
+    ident = (device["manufacturer"], device["product_id"], device["serial_number"])
+    sw = device.get("software_version", 331)
+    for wanted, name, upload in ((spo2_resp, "SpO2/breathing-rate", _upload_spo2_respiration),
+                                 (hrv, "HRV", _upload_hrv)):
+        if not wanted:
+            continue
+        try:
+            upload(health, garmin, session, ident, sw)
+        except Exception as e:
+            log.warning("%s upload failed (%s) — continuing without it.", name, e)
+
+
 def main_sessions(sessions: list[dict]) -> dict[str, dict]:
     """The longest session per wake date by recorded time (split nights merged, naps dropped first)."""
     best: dict[str, dict] = {}
@@ -456,6 +529,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                  d, f"{s['start']:%H:%M}", f"{s['end']:%H:%M}", asleep_minutes(s), need,
                  "n/a" if hr is None else f"{hr:.0f}", hrv_by_date.get(d, "n/a"), score,
                  "n/a" if stress is None else f"{stress:.0f}")
+        upload_vitals(health, garmin, s, device, spo2_resp=scfg.get("vitals", True), hrv=scfg.get("hrv", True))
         try:
             result = garmin.upload_fit_for_window(fit_bytes, s["start"])
         except Exception as e:

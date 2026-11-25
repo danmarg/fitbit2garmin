@@ -35,7 +35,7 @@ docker compose logs -f
 
 ## Architecture
 
-This service syncs Fitbit intraday heart rate and step data (read via the Google Health API) to Garmin Connect by encoding valid binary Garmin Monitoring (type 9) FIT files and uploading them via the device sync endpoint — making them appear as if from a real Garmin device.
+This service syncs Fitbit intraday heart rate and step data (read via the Google Health API) to Garmin Connect by encoding valid binary Garmin Monitoring FIT files (file_id.type 32) and uploading them via the device sync endpoint — making them appear as if from a real Garmin device.
 
 ### Data flow
 
@@ -82,6 +82,16 @@ short of need, hours short beyond 3, hours over need (capped at 1), sleeping HR.
 features: sleeping HR, Fitbit nightly HRV. Only rough GENERIC_* starting values are in
 code. Forward-chaining on one user's history: score ~3.9 points, stress ~1.3.
 
+Before each sleep file, the night's vitals (`sleep.vitals` for SpO2 and breathing rate,
+`sleep.hrv` for HRV; both default on) go up in the watch's
+order (layouts copied from FR255S files, 2026-11-25):
+- SpO2 (269) and breathing rate (297) in type-32 files, one per local date. Fitbit gives
+  only per-stage breathing rates, so each minute gets its stage's rate. Garmin showed both
+  on the sleep page, even when uploaded after the sleep file.
+- HRV (type 68): 5-minute values (371) plus a summary (370) with the baseline left invalid,
+  stamped 1 s before the sleep file. Garmin answered "File processed." but showed nothing for
+  a night whose sleep file was already there; whether HRV shows when sent first is untested.
+
 ### Key files
 
 | File | Role |
@@ -125,7 +135,7 @@ To customize the Docker schedule, edit `crontab` before building the image, or o
 
 ### FIT file details
 
-- File type 9 (Monitoring), protocol v1.0, profile v20.49
+- file_id.type 32 (monitoring_b, as the FR255S writes), protocol v1.0, profile v20.49
 - Messages: `file_id` → `device_info` → `monitoring_info` → one `monitoring` record per minute
 - `heart_rate` as uint8; steps encoded as `cycles` (steps × 2) as uint32 cumulative per segment
 - `local_timestamp` = Garmin epoch timestamp + UTC offset seconds (handles DST)

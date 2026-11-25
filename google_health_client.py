@@ -371,6 +371,57 @@ class GoogleHealthClient:
         values = [v for v in values if v > 0]
         return sum(values) / len(values) if values else None
 
+    def _samples(self, data_type: str, key: str, field: str, value: str, start: datetime, end: datetime,
+                 platform: str) -> list[tuple[datetime, float]]:
+        """(time, value) samples from `platform` with start <= time < end, sorted by time."""
+        ts = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        points = self._list_points(
+            data_type, f'{key}.sample_time.physical_time >= "{ts(start)}" AND '
+                       f'{key}.sample_time.physical_time < "{ts(end)}"', page_size=5000)
+        out = []
+        for p in points:
+            v = p.get(field) or {}
+            if (p.get("dataSource") or {}).get("platform") == platform and v.get(value):
+                out.append((_parse_time(v["sampleTime"]["physicalTime"]), float(v[value])))
+        return sorted(out)
+
+    def get_spo2(self, start: datetime, end: datetime, platform: str = "FITBIT") -> list[tuple[datetime, float]]:
+        """Per-minute SpO2 (%) that Fitbit records during sleep."""
+        return self._samples("oxygen-saturation", "oxygen_saturation", "oxygenSaturation", "percentage",
+                             start, end, platform)
+
+    def get_hrv(self, start: datetime, end: datetime, platform: str = "FITBIT") -> list[tuple[datetime, float]]:
+        """5-minute HRV (RMSSD, ms) that Fitbit records during sleep."""
+        return self._samples("heart-rate-variability", "heart_rate_variability", "heartRateVariability",
+                             "rootMeanSquareOfSuccessiveDifferencesMilliseconds", start, end, platform)
+
+    def get_sleep_respiration(self, near: datetime, platform: str = "FITBIT") -> dict[str, float] | None:
+        """
+        A night's breathing rate (breaths/min) by sleep stage — DEEP, LIGHT, REM and FULL
+        (the whole night) — from the summary stamped closest to `near` (the night's end)
+        within two hours. Fitbit gives no per-minute rate. Fitbit may write a night's
+        summary more than once; the closest is the one for the night as finally recorded.
+        """
+        ts = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        lo, hi = near - timedelta(hours=2), near + timedelta(hours=2)
+        points = self._list_points(
+            "respiratory-rate-sleep-summary",
+            f'respiratory_rate_sleep_summary.sample_time.physical_time >= "{ts(lo)}" AND '
+            f'respiratory_rate_sleep_summary.sample_time.physical_time < "{ts(hi)}"', page_size=25)
+        best = None
+        for p in points:
+            v = p.get("respiratoryRateSleepSummary") or {}
+            if (p.get("dataSource") or {}).get("platform") != platform:
+                continue
+            gap = abs(_parse_time(v["sampleTime"]["physicalTime"]) - near)
+            rates = {stage: (v.get(f"{name}Stats") or {}).get("breathsPerMinute")
+                     for stage, name in (("DEEP", "deepSleep"), ("LIGHT", "lightSleep"),
+                                         ("REM", "remSleep"), ("FULL", "fullSleep"))}
+            rates = {k: float(r) for k, r in rates.items() if r}
+            if rates.get("FULL") and (best is None or gap < best[0]):
+                best = (gap, rates)
+        return best and best[1]
+
     def get_combined_intraday(self, lookback_hours: int = 4) -> tuple[list[dict], int]:
         """
         Fetch HR + Steps for the last `lookback_hours` hours, merged by minute,
