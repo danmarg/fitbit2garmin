@@ -214,7 +214,7 @@ def build_monitoring_fit(
     time_created_offset: int = 0,
 ) -> bytes:
     """
-    Build a complete, valid Garmin Monitoring FIT file (type 9).
+    Build a complete, valid Garmin Monitoring FIT file (file_id.type 32, monitoring_b).
 
     time_created_offset moves file_id.time_created that many seconds before the first
     point. Garmin identifies a file by time_created, so a re-upload of the same span
@@ -283,7 +283,8 @@ def build_monitoring_fit(
 # later one as a duplicate. Every file starts its time_created at a fixed second of the
 # minute so the kinds can never meet:
 #   heart rate :00 (first point)        backfill :45–:59 (main.BACKFILL_MAX_SHIFT)
-#   SpO2/breathing :19 (build_vitals_fit) HRV :29, sleep :30 (stage ends are whole minutes)
+#   SpO2/breathing :19 (build_vitals_fit) HRV :29, sleep :30 (from the last stage end,
+#   floored to the minute)
 SLEEP_CREATED_DELAY = 90
 
 MESG_NUM_FILE_CREATOR = 49
@@ -393,7 +394,7 @@ def build_sleep_fit(
     ignores the night without it. time_created is created_delay seconds after waking.
     """
     start_ts, end_ts, levels = _sleep_level_records(stages)
-    created = end_ts + created_delay
+    created = end_ts // 60 * 60 + created_delay  # whole minute first: see SLEEP_CREATED_DELAY
 
     m = b""
     m += _definition_record(0, MESG_NUM_FILE_ID, [
@@ -471,7 +472,7 @@ def build_vitals_fit(
     _monitoring_messages). time_created is 41 s before the first whole minute: records
     before time_created are dropped, and Garmin treats a second file with the same
     serial and time_created as a duplicate, so it must miss the other files' seconds
-    (see TIME_CREATED_SECONDS). If that would fall before local midnight, it is 19 s
+    (see SLEEP_CREATED_DELAY). If that would fall before local midnight, it is 19 s
     after midnight instead. Raises ValueError if no reading is left after that.
     """
     times = [t for t, _ in spo2] + [t for t, _ in respiration]
@@ -509,6 +510,11 @@ def build_vitals_fit(
     return raw
 
 
+def _ms128(ms: float) -> int:
+    """HRV in ms as uint16 / 128, clamped below the invalid value."""
+    return max(0, min(0xFFFE, round(ms * 128)))
+
+
 def build_hrv_fit(
     values: list[tuple[datetime, float]],
     created: datetime,
@@ -539,12 +545,12 @@ def build_hrv_fit(
     m += _device_info_messages(manufacturer, product_id, serial_number, to_garmin_ts(values[0][0]), software_version)
     m += _definition_record(3, MESG_NUM_HRV_VALUE, [(253, 4, UINT32), (0, 2, UINT16)])
     for t, v in values:
-        m += _data_record(3, [to_garmin_ts(t), round(v * 128)], "IH")
+        m += _data_record(3, [to_garmin_ts(t), _ms128(v)], "IH")
     m += _definition_record(4, MESG_NUM_HRV_STATUS_SUMMARY, [
         (253, 4, UINT32), (0, 2, UINT16), (1, 2, UINT16), (2, 2, UINT16), (3, 2, UINT16), (4, 2, UINT16),
         (5, 2, UINT16), (6, 1, ENUM),
     ])
-    m += _data_record(4, [ts, 0xFFFF, round(sum(ms) / len(ms) * 128), round(max(ms) * 128),
+    m += _data_record(4, [ts, 0xFFFF, _ms128(sum(ms) / len(ms)), _ms128(max(ms)),
                           0xFFFF, 0xFFFF, 0xFFFF, 0], "IHHHHHHB")
     raw = _wrap_fit(m)
     log.info("Built HRV FIT file: %d value(s), %d bytes", len(values), len(raw))

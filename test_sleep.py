@@ -560,12 +560,24 @@ class TestVitals(unittest.TestCase):
         s = {"start": T, "end": T + timedelta(minutes=50), "utc_offset_seconds": 3600,
              "stages": [stage(0, 10, "DEEP"), stage(10, 40, "AWAKE"), stage(40, 50, "REM")],
              "parts": [(T, T + timedelta(minutes=10)), (T + timedelta(minutes=40), T + timedelta(minutes=50))]}
-        out = minute_respiration(s, {"DEEP": 15.0, "REM": 17.0, "FULL": 16.0})
+        rates = {"DEEP": 15.0, "REM": 17.0, "FULL": 16.0}
+        out = minute_respiration(s, [rates, rates])
         self.assertEqual(len(out), 20)
         self.assertEqual({v for t, v in out if t <= T + timedelta(minutes=10)}, {15.0})
         self.assertEqual({v for t, v in out if t > T + timedelta(minutes=40)}, {17.0})
-        out = minute_respiration(s, {"FULL": 16.0})
-        self.assertEqual({v for _, v in out}, {16.0})
+        out = minute_respiration(s, [{"FULL": 16.0}, {"FULL": 18.0}])
+        self.assertEqual([v for _, v in out], [16.0] * 10 + [18.0] * 10)
+        self.assertEqual(len(minute_respiration(s, [None, rates])), 10)
+
+    def test_off_second_stage_end_keeps_sleep_and_hrv_seconds(self):
+        stages = [stage(0, 60, "LIGHT"), {"start": T + timedelta(minutes=60),
+                                          "end": T + timedelta(minutes=90, seconds=30), "type": "DEEP"}]
+        raw = build_sleep_fit(stages, 1, 3993, 7, assessment={"overall_sleep_score": 70})
+        self.assertEqual(fit_fields(raw)[0][1][4] % 60, 30)
+
+    def test_extreme_hrv_is_clamped(self):
+        raw = build_hrv_fit([(T, 600.0), (T + timedelta(minutes=5), 20.0)], T + timedelta(hours=1), 1, 3993, 7)
+        self.assertEqual([v[0] for m, v in fit_fields(raw) if m == 371], [0xFFFE, 2560])
 
 
 class TestRunSleepSyncVitals(unittest.TestCase):

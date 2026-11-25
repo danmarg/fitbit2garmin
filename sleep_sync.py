@@ -253,14 +253,17 @@ def sleeping_heart_rate(health, session: dict) -> float | None:
     return total / weight if weight else None
 
 
-def minute_respiration(session: dict, rates: dict[str, float]) -> list[tuple[datetime, float]]:
+def minute_respiration(session: dict, rates_by_part: list[dict[str, float] | None]) -> list[tuple[datetime, float]]:
     """
     A breathing rate for each recorded minute of the night, from Fitbit's per-stage
-    averages (it gives no per-minute rate): each minute gets its stage's rate, and
-    awake minutes or stages without one get the whole-night rate.
+    averages (it gives no per-minute rate), one set per recorded part: each minute gets
+    its stage's rate, and awake minutes or stages without one get the whole-part rate.
+    Parts without rates are left out.
     """
     out = []
-    for a, b in parts(session):
+    for (a, b), rates in zip(parts(session), rates_by_part):
+        if not rates:
+            continue
         t = a.replace(second=0, microsecond=0) + timedelta(minutes=1)
         while t <= b:
             stage = next((x["type"] for x in session["stages"] if x["start"] < t <= x["end"]), None)
@@ -286,10 +289,12 @@ def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: in
     except Exception as e:
         log.warning("Fitbit SpO2 unavailable (%s) — sending breathing rate only.", e)
     try:
-        rates = health.get_sleep_respiration(end)
-        if rates:
-            resp = minute_respiration(session, rates)
-        else:
+        # Fitbit writes a summary per recorded part; a part without one near its end
+        # uses the night's (closest to the end).
+        night = health.get_sleep_respiration(end)
+        by_part = [night if b == end else (health.get_sleep_respiration(b) or night) for _, b in parts(session)]
+        resp = minute_respiration(session, by_part)
+        if not any(by_part):
             log.info("No Fitbit breathing rate for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
     except Exception as e:
         log.warning("Fitbit breathing rate unavailable (%s) — sending SpO2 only.", e)
@@ -322,7 +327,7 @@ def _upload_hrv(health, garmin, session: dict, ident: tuple, sw: int):
 def sleep_created(session: dict) -> datetime:
     """The sleep file's time_created, as build_sleep_fit sets it."""
     _, end_ts, _ = _sleep_level_records(session["stages"])
-    return datetime.fromtimestamp(end_ts + GARMIN_EPOCH + SLEEP_CREATED_DELAY, tz=timezone.utc)
+    return datetime.fromtimestamp(end_ts // 60 * 60 + GARMIN_EPOCH + SLEEP_CREATED_DELAY, tz=timezone.utc)
 
 
 def upload_vitals(health, garmin, session: dict, device: dict, spo2_resp: bool = True, hrv: bool = True):
