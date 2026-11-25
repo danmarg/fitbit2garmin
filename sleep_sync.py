@@ -289,10 +289,23 @@ def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: in
     except Exception as e:
         log.warning("Fitbit SpO2 unavailable (%s) — sending breathing rate only.", e)
     try:
-        # Fitbit writes a summary per recorded part; a part without one near its end
-        # uses the night's (closest to the end).
         night = health.get_sleep_respiration(end)
-        by_part = [night if b == end else (health.get_sleep_respiration(b) or night) for _, b in parts(session)]
+    except Exception as e:
+        log.warning("Fitbit breathing rate unavailable (%s).", e)
+        night = None
+    # Fitbit writes a summary per recorded part: an earlier part uses one stamped between
+    # its start and the next part's, else the night's (closest to the end).
+    ps = parts(session)
+    by_part = []
+    for i, (a, b) in enumerate(ps):
+        rates = None
+        if i < len(ps) - 1:
+            try:
+                rates = health.get_sleep_respiration(b, lo=a, hi=ps[i + 1][0])
+            except Exception as e:
+                log.warning("Fitbit breathing rate for the part ending %s unavailable (%s).", f"{b:%H:%M}", e)
+        by_part.append(rates or night)
+    try:
         resp = minute_respiration(session, by_part)
         if not any(by_part):
             log.info("No Fitbit breathing rate for the night ending %s.", f"{end:%Y-%m-%d %H:%M}")
@@ -302,7 +315,8 @@ def _upload_spo2_respiration(health, garmin, session: dict, ident: tuple, sw: in
     for day in sorted(set(spo2_by_day) | set(resp_by_day)):
         sp, rs = spo2_by_day.get(day, []), resp_by_day.get(day, [])
         try:
-            fit = build_vitals_fit(sp, rs, *ident, software_version=sw, utc_offset_seconds=offset)
+            fit = build_vitals_fit(sp, rs, *ident, software_version=sw, utc_offset_seconds=offset,
+                                   anchor=session["start"])
         except ValueError as e:  # nothing left for that day (readings before time_created)
             log.info("No SpO2 or breathing rate to send for %s (%s).", day, e)
             continue
@@ -556,7 +570,7 @@ def run_sleep_sync(cfg: dict, health, garmin, store: SleepStore, now: datetime |
                  d, f"{s['start']:%H:%M}", f"{s['end']:%H:%M}", asleep_minutes(s), need,
                  "n/a" if hr is None else f"{hr:.0f}", hrv_by_date.get(d, "n/a"), score,
                  "n/a" if stress is None else f"{stress:.0f}")
-        upload_vitals(health, garmin, s, device, spo2_resp=scfg.get("vitals", True), hrv=scfg.get("hrv", True))
+        upload_vitals(health, garmin, s, device, spo2_resp=scfg.get("vitals", True), hrv=scfg.get("hrv", False))
         try:
             result = garmin.upload_fit_for_window(fit_bytes, s["start"], kind="sleep")
         except Exception as e:

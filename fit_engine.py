@@ -460,6 +460,7 @@ def build_vitals_fit(
     serial_number: int,
     software_version: int = 331,
     utc_offset_seconds: int = 0,
+    anchor: datetime | None = None,
 ) -> bytes:
     """
     Build a monitoring_b file (type 32) with SpO2 (269, %) and respiration (297,
@@ -469,7 +470,9 @@ def build_vitals_fit(
     date (Garmin discards monitoring files that span local midnight).
 
     The one walking cycle keeps Garmin from discarding the file as empty (see
-    _monitoring_messages). time_created is 41 s before the first whole minute: records
+    _monitoring_messages). time_created is 41 s before the whole minute of `anchor`
+    (the night's start, so a re-sent night keeps its time_created even if Fitbit added
+    readings; default: the first reading). Records
     before time_created are dropped, and Garmin treats a second file with the same
     serial and time_created as a duplicate, so it must miss the other files' seconds
     (see SLEEP_CREATED_DELAY). If that would fall before local midnight, it is 19 s
@@ -478,7 +481,7 @@ def build_vitals_fit(
     times = [t for t, _ in spo2] + [t for t, _ in respiration]
     if not times:
         raise ValueError("No SpO2 or respiration readings provided")
-    created = to_garmin_ts(min(times).replace(second=0, microsecond=0)) - 41
+    created = to_garmin_ts((anchor or min(times)).replace(second=0, microsecond=0)) - 41
     # ...but never before local midnight: a time_created on the previous local date would
     # make the file span midnight. Readings before it (at most the first minute) are dropped.
     local_midnight = (created + utc_offset_seconds) // 86400 * 86400 - utc_offset_seconds

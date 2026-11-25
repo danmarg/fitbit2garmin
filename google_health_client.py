@@ -395,15 +395,16 @@ class GoogleHealthClient:
         return self._samples("heart-rate-variability", "heart_rate_variability", "heartRateVariability",
                              "rootMeanSquareOfSuccessiveDifferencesMilliseconds", start, end, platform)
 
-    def get_sleep_respiration(self, near: datetime, platform: str = "FITBIT") -> dict[str, float] | None:
+    def get_sleep_respiration(self, near: datetime, platform: str = "FITBIT", lo: datetime | None = None,
+                              hi: datetime | None = None) -> dict[str, float] | None:
         """
         A night's breathing rate (breaths/min) by sleep stage — DEEP, LIGHT, REM and FULL
         (the whole night) — from the summary stamped closest to `near` (the night's end)
-        within two hours. Fitbit gives no per-minute rate. Fitbit may write a night's
+        within two hours (or within [lo, hi) when given). Fitbit gives no per-minute rate. Fitbit may write a night's
         summary more than once; the closest is the one for the night as finally recorded.
         """
         ts = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        lo, hi = near - timedelta(hours=2), near + timedelta(hours=2)
+        lo, hi = lo or near - timedelta(hours=2), hi or near + timedelta(hours=2)
         points = self._list_points(
             "respiratory-rate-sleep-summary",
             f'respiratory_rate_sleep_summary.sample_time.physical_time >= "{ts(lo)}" AND '

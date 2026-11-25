@@ -48,7 +48,7 @@ Google Health API (:rollUp, 60s windows, reconciled)
       new (after watermark) → split_segments → build_monitoring_fit → upload → save_last_uploaded
       old (≤ watermark, still missing on Garmin) → backfill runs ≥ backfill_min_minutes
           → steps stripped if Garmin already has steps there
-          → time_created shifted 1–3 s earlier per attempt (avoids 409 duplicate)
+          → time_created shifted 1–15 s earlier per attempt (BACKFILL_MAX_SHIFT; avoids 409 duplicate)
           → at most backfill_max_attempts per run (state.json backfill_attempts)
 ```
 
@@ -83,7 +83,7 @@ features: sleeping HR, Fitbit nightly HRV. Only rough GENERIC_* starting values 
 code. Forward-chaining on one user's history: score ~3.9 points, stress ~1.3.
 
 Before each sleep file, the night's vitals (`sleep.vitals` for SpO2 and breathing rate,
-`sleep.hrv` for HRV; both default on) go up in the watch's
+`sleep.hrv` for HRV, off by default until verified) go up in the watch's
 order (layouts copied from FR255S files, 2026-11-25):
 - SpO2 (269) and breathing rate (297) in type-32 files, one per local date. Fitbit gives
   only per-stage breathing rates, so each minute gets its stage's rate. Garmin showed both
